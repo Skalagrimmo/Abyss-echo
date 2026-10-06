@@ -1,0 +1,6 @@
+{
+  "name": "Ехо Безодні",
+  "description": "Похмурий 16-бітний роглайк з процедурною генерацією, покроковими тактичними боями, еволюцією біомеханічних мутацій та мораллю виживання.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
