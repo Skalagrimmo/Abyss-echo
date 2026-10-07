@@ -21,20 +21,10 @@ enum class ScreenState {
     GAME_OVER
 }
 
-data class StoryRecord(
-    val floor: Int,
-    val title: String,
-    val choiceMade: String,
-    val consequence: String
-)
-
 data class GameUiState(
     val currentScreen: ScreenState = ScreenState.MAIN_MENU,
-    val runSeed: Long = 0L,
-    val currentFloorNumber: Int = 1,
+    val runState: RunState = RunState(),
     val sectorTitle: String = "Затоплені Катакомби",
-    val turnCount: Int = 0,
-    val timePhase: TimePhase = TimePhase.TWILIGHT,
     val player: Player = Player(
         pos = GridPos(2, 2),
         currentHp = 90,
@@ -52,15 +42,17 @@ data class GameUiState(
         ItemCatalog.smellingSalts.copy(quantity = 1)
     ),
     val activeDilemma: MoralDilemma? = null,
-    val storyChronicle: List<StoryRecord> = emptyList(),
-    val factionReputations: Map<Faction, Int> = mapOf(
-        Faction.IRON_FOUNDRY to 0,
-        Faction.CHTHONIC_ASCETICS to 0,
-        Faction.FORGOTTEN_REMNANTS to 0
-    ),
     val isVictory: Boolean = false,
     val deathReason: String = ""
-)
+) {
+    val runSeed: Long get() = runState.seed
+    val currentFloorNumber: Int get() = runState.currentFloorNumber
+    val turnCount: Int get() = runState.turnCount
+    val timePhase: TimePhase get() = runState.timePhase
+    val storyChronicle: List<StoryRecord> get() = runState.storyChronicle
+    val factionReputations: Map<Faction, Int> get() = runState.factionReputations
+    val eventHistory: List<RunEvent> get() = runState.eventHistory
+}
 
 class GameViewModel : ViewModel() {
     private val _uiState = MutableStateFlow(GameUiState())
@@ -108,14 +100,20 @@ class GameViewModel : ViewModel() {
         }
 
         runRandom = Random(seed)
-        _uiState.update { it.copy(runSeed = seed) }
+        _uiState.update {
+            it.copy(
+                runState = RunState(seed = seed).recordEvent(
+                    RunEvent(0, 1, RunEventType.RUN_STARTED, "Новий забіг розпочато.")
+                )
+            )
+        }
         loadFloor(1, player)
     }
 
     private fun floorSeed(floorNum: Int): Long {
         // Stable per-run/per-floor seed. The constants intentionally keep
         // adjacent floors from becoming simple variations of one another.
-        return _uiState.value.runSeed xor (floorNum.toLong() * -7046029254386353131L)
+        return _uiState.value.runState.seed xor (floorNum.toLong() * -7046029254386353131L)
     }
 
     private fun loadFloor(floorNum: Int, playerOverride: Player? = null) {
@@ -135,7 +133,15 @@ class GameViewModel : ViewModel() {
         _uiState.update { current ->
             current.copy(
                 currentScreen = ScreenState.DUNGEON,
-                currentFloorNumber = floorNum,
+                runState = current.runState.copy(currentFloorNumber = floorNum)
+                    .recordEvent(
+                        RunEvent(
+                            current.turnCount,
+                            floorNum,
+                            RunEventType.FLOOR_ENTERED,
+                            "Вхід у сектор: " + floor.sectorName + "."
+                        )
+                    ),
                 sectorTitle = floor.sectorName,
                 player = player,
                 enemies = floor.enemies,
@@ -210,7 +216,15 @@ class GameViewModel : ViewModel() {
         if (dungeon.pendingDilemma != null && runRandom.nextDouble() < 0.08) {
             val dilemma = dungeon.pendingDilemma
             dungeon.pendingDilemma = null
-            _uiState.update { it.copy(activeDilemma = dilemma, currentScreen = ScreenState.DILEMMA_POPUP) }
+            _uiState.update { current ->
+                current.copy(
+                    activeDilemma = dilemma,
+                    currentScreen = ScreenState.DILEMMA_POPUP,
+                    runState = current.runState.recordEvent(
+                        RunEvent(current.turnCount, current.currentFloorNumber, RunEventType.DILEMMA_TRIGGERED, dilemma.title)
+                    )
+                )
+            }
             SoundSynthesizer.playEldritchDrone()
         }
 
@@ -329,7 +343,17 @@ class GameViewModel : ViewModel() {
             addLog("🌑 Непроглядна темрява сіє жах! -2 Глузду.")
         }
 
-        _uiState.update { it.copy(turnCount = turns, timePhase = newPhase) }
+        _uiState.update { current ->
+            val nextRun = current.runState.copy(turnCount = turns, timePhase = newPhase)
+            val phaseChanged = newPhase != current.timePhase
+            current.copy(
+                runState = if (phaseChanged) {
+                    nextRun.recordEvent(
+                        RunEvent(turns, current.currentFloorNumber, RunEventType.PHASE_CHANGED, "Настала фаза: ${newPhase.title}.")
+                    )
+                } else nextRun
+            )
+        }
     }
 
     fun chooseDilemmaOption(choice: DilemmaChoice) {
@@ -374,8 +398,17 @@ class GameViewModel : ViewModel() {
                 currentScreen = ScreenState.DUNGEON,
                 activeDilemma = null,
                 player = player.copy(),
-                factionReputations = currentFactions,
-                storyChronicle = current.storyChronicle + record
+                runState = current.runState.copy(
+                    factionReputations = currentFactions,
+                    storyChronicle = current.storyChronicle + record
+                ).recordEvent(
+                    RunEvent(
+                        current.turnCount,
+                        current.currentFloorNumber,
+                        RunEventType.DILEMMA_RESOLVED,
+                        "Вибір: ${choice.title}."
+                    )
+                )
             )
         }
     }
@@ -408,7 +441,19 @@ class GameViewModel : ViewModel() {
 
         SoundSynthesizer.playMutationChime()
         addLog("🧬 Тіло зазнало мутації: [${mutation.name}].")
-        _uiState.update { it.copy(player = player.copy()) }
+        _uiState.update { current ->
+            current.copy(
+                player = player.copy(),
+                runState = current.runState.recordEvent(
+                    RunEvent(
+                        current.turnCount,
+                        current.currentFloorNumber,
+                        RunEventType.MUTATION_ACQUIRED,
+                        "Мутація: ${mutation.name}."
+                    )
+                )
+            )
+        }
     }
 
     fun useItem(item: Item) {
