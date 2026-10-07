@@ -202,9 +202,16 @@ class GameViewModel : ViewModel() {
             }
         }
 
-        // Random chance of triggering sector's moral dilemma on discovery
-        if (dungeon.pendingDilemma != null && runRandom.nextDouble() < 0.08) {
-            val dilemma = dungeon.pendingDilemma
+        // Procedural event check: chance depends on floor, time phase and sanity.
+        val eventDecision = RunEventEngine.shouldTriggerDilemma(
+            state = _uiState.value.runState,
+            pending = dungeon.pendingDilemma,
+            playerSanity = currentP.sanity,
+            maxSanity = currentP.maxSanity,
+            random = runRandom
+        )
+        if (eventDecision.event != null) {
+            val dilemma = eventDecision.event
             dungeon.pendingDilemma = null
             _uiState.update { current ->
                 current.copy(
@@ -213,6 +220,7 @@ class GameViewModel : ViewModel() {
                     runState = RunEventEngine.triggerDilemma(current.runState, dilemma)
                 )
             }
+            addLog("⚠️ Подія Безодні: шанс ${(eventDecision.chance * 100).toInt()}%.")
             SoundSynthesizer.playEldritchDrone()
         }
 
