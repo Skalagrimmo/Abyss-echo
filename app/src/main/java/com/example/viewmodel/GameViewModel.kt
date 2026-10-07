@@ -9,6 +9,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlin.random.Random
 
 enum class ScreenState {
     MAIN_MENU,
@@ -68,6 +69,8 @@ class GameViewModel : ViewModel() {
     var currentDungeon: DungeonFloor? = null
         private set
 
+    private var runRandom: Random = Random.Default
+
     fun startNewGame(
         archetype: Archetype,
         seed: Long = System.currentTimeMillis()
@@ -104,6 +107,7 @@ class GameViewModel : ViewModel() {
             }
         }
 
+        runRandom = Random(seed)
         _uiState.update { it.copy(runSeed = seed) }
         loadFloor(1, player)
     }
@@ -203,7 +207,7 @@ class GameViewModel : ViewModel() {
         }
 
         // Random chance of triggering sector's moral dilemma on discovery
-        if (dungeon.pendingDilemma != null && Math.random() < 0.08) {
+        if (dungeon.pendingDilemma != null && runRandom.nextDouble() < 0.08) {
             val dilemma = dungeon.pendingDilemma
             dungeon.pendingDilemma = null
             _uiState.update { it.copy(activeDilemma = dilemma, currentScreen = ScreenState.DILEMMA_POPUP) }
@@ -299,7 +303,6 @@ class GameViewModel : ViewModel() {
 
         _uiState.update { current ->
             current.copy(
-                turnCount = current.turnCount + 1,
                 player = player.copy(),
                 enemies = dungeon.enemies.filter { !it.isDead }
             )
