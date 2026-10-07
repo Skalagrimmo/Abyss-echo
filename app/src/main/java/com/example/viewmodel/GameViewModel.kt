@@ -29,6 +29,7 @@ data class StoryRecord(
 
 data class GameUiState(
     val currentScreen: ScreenState = ScreenState.MAIN_MENU,
+    val runSeed: Long = 0L,
     val currentFloorNumber: Int = 1,
     val sectorTitle: String = "Затоплені Катакомби",
     val turnCount: Int = 0,
@@ -67,7 +68,10 @@ class GameViewModel : ViewModel() {
     var currentDungeon: DungeonFloor? = null
         private set
 
-    fun startNewGame(archetype: Archetype) {
+    fun startNewGame(
+        archetype: Archetype,
+        seed: Long = System.currentTimeMillis()
+    ) {
         val player = Player(
             pos = GridPos(0, 0),
             currentHp = archetype.hp,
@@ -100,11 +104,21 @@ class GameViewModel : ViewModel() {
             }
         }
 
+        _uiState.update { it.copy(runSeed = seed) }
         loadFloor(1, player)
     }
 
+    private fun floorSeed(floorNum: Int): Long {
+        // Stable per-run/per-floor seed. The constants intentionally keep
+        // adjacent floors from becoming simple variations of one another.
+        return _uiState.value.runSeed xor (floorNum.toLong() * -7046029254386353131L)
+    }
+
     private fun loadFloor(floorNum: Int, playerOverride: Player? = null) {
-        val floor = DungeonGenerator.generateFloor(floorNum)
+        val floor = DungeonGenerator.generateFloor(
+            floorNumber = floorNum,
+            seed = floorSeed(floorNum)
+        )
         currentDungeon = floor
 
         val player = (playerOverride ?: _uiState.value.player).copy(
