@@ -102,9 +102,7 @@ class GameViewModel : ViewModel() {
         runRandom = Random(seed)
         _uiState.update {
             it.copy(
-                runState = RunState(seed = seed).recordEvent(
-                    RunEvent(0, 1, RunEventType.RUN_STARTED, "Новий забіг розпочато.")
-                )
+                runState = RunEventEngine.start(seed)
             )
         }
         loadFloor(1, player)
@@ -133,15 +131,7 @@ class GameViewModel : ViewModel() {
         _uiState.update { current ->
             current.copy(
                 currentScreen = ScreenState.DUNGEON,
-                runState = current.runState.copy(currentFloorNumber = floorNum)
-                    .recordEvent(
-                        RunEvent(
-                            current.turnCount,
-                            floorNum,
-                            RunEventType.FLOOR_ENTERED,
-                            "Вхід у сектор: " + floor.sectorName + "."
-                        )
-                    ),
+                runState = RunEventEngine.enterFloor(current.runState, floor),
                 sectorTitle = floor.sectorName,
                 player = player,
                 enemies = floor.enemies,
@@ -220,9 +210,7 @@ class GameViewModel : ViewModel() {
                 current.copy(
                     activeDilemma = dilemma,
                     currentScreen = ScreenState.DILEMMA_POPUP,
-                    runState = current.runState.recordEvent(
-                        RunEvent(current.turnCount, current.currentFloorNumber, RunEventType.DILEMMA_TRIGGERED, dilemma.title)
-                    )
+                    runState = RunEventEngine.triggerDilemma(current.runState, dilemma)
                 )
             }
             SoundSynthesizer.playEldritchDrone()
@@ -344,15 +332,7 @@ class GameViewModel : ViewModel() {
         }
 
         _uiState.update { current ->
-            val nextRun = current.runState.copy(turnCount = turns, timePhase = newPhase)
-            val phaseChanged = newPhase != current.timePhase
-            current.copy(
-                runState = if (phaseChanged) {
-                    nextRun.recordEvent(
-                        RunEvent(turns, current.currentFloorNumber, RunEventType.PHASE_CHANGED, "Настала фаза: ${newPhase.title}.")
-                    )
-                } else nextRun
-            )
+            current.copy(runState = RunEventEngine.advanceTime(current.runState, turns, newPhase))
         }
     }
 
@@ -398,16 +378,12 @@ class GameViewModel : ViewModel() {
                 currentScreen = ScreenState.DUNGEON,
                 activeDilemma = null,
                 player = player.copy(),
-                runState = current.runState.copy(
-                    factionReputations = currentFactions,
-                    storyChronicle = current.storyChronicle + record
-                ).recordEvent(
-                    RunEvent(
-                        current.turnCount,
-                        current.currentFloorNumber,
-                        RunEventType.DILEMMA_RESOLVED,
-                        "Вибір: ${choice.title}."
-                    )
+                runState = RunEventEngine.resolveDilemma(
+                    current.runState.copy(
+                        factionReputations = currentFactions,
+                        storyChronicle = current.storyChronicle + record
+                    ),
+                    choice
                 )
             )
         }
@@ -444,14 +420,7 @@ class GameViewModel : ViewModel() {
         _uiState.update { current ->
             current.copy(
                 player = player.copy(),
-                runState = current.runState.recordEvent(
-                    RunEvent(
-                        current.turnCount,
-                        current.currentFloorNumber,
-                        RunEventType.MUTATION_ACQUIRED,
-                        "Мутація: ${mutation.name}."
-                    )
-                )
+                runState = RunEventEngine.acquireMutation(current.runState, mutation)
             )
         }
     }
