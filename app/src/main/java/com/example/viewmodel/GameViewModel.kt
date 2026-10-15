@@ -4,6 +4,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.engine.*
 import com.example.model.*
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -43,13 +44,15 @@ data class GameUiState(
     val enemies: List<Enemy> = emptyList(),
     val targetEnemyId: String? = null,
     val selectedSkill: CombatSkill = SkillCatalog.strikeLight,
-    val logs: List<String> = listOf("Ласкаво просимо до Безодні. Кожен крок відраховує темний час."),
+    val floatingFxList: List<FloatingFx> = emptyList(),
+    val activeBanner: MilestoneBanner? = null,
     val availableInventory: List<Item> = listOf(
         ItemCatalog.salve.copy(quantity = 2),
         ItemCatalog.torchOil.copy(quantity = 2),
         ItemCatalog.smellingSalts.copy(quantity = 1)
     ),
     val activeDilemma: MoralDilemma? = null,
+    val pendingHarvest: DefeatedHarvest? = null,
     val storyChronicle: List<StoryRecord> = emptyList(),
     val factionReputations: Map<Faction, Int> = mapOf(
         Faction.IRON_FOUNDRY to 0,
@@ -83,21 +86,14 @@ class GameViewModel : ViewModel() {
             archetype = archetype
         )
 
-        // Starting abilities
         player.knownSkills.add(SkillCatalog.strikeLight)
         player.knownSkills.add(SkillCatalog.strikeHeavy)
         player.knownSkills.add(SkillCatalog.throwTorch)
 
         when (archetype) {
-            Archetype.IRON_DESERTER -> {
-                player.knownSkills.add(SkillCatalog.pistonSlam)
-            }
-            Archetype.CHTHONIC_PENITENT -> {
-                player.knownSkills.add(SkillCatalog.siphonLash)
-            }
-            Archetype.CHRONO_OUTCAST -> {
-                player.knownSkills.add(SkillCatalog.voidGaze)
-            }
+            Archetype.IRON_DESERTER -> player.knownSkills.add(SkillCatalog.pistonSlam)
+            Archetype.CHTHONIC_PENITENT -> player.knownSkills.add(SkillCatalog.siphonLash)
+            Archetype.CHRONO_OUTCAST -> player.knownSkills.add(SkillCatalog.voidGaze)
         }
 
         loadFloor(1, player)
@@ -123,7 +119,12 @@ class GameViewModel : ViewModel() {
                 enemies = floor.enemies,
                 targetEnemyId = floor.enemies.firstOrNull()?.id,
                 activeDilemma = null,
-                logs = listOf("Вхід у сектор: ${floor.sectorName}. Метал дрижить від тиску.") + current.logs.take(15)
+                floatingFxList = emptyList(),
+                activeBanner = MilestoneBanner(
+                    text = floor.sectorName,
+                    icon = "🏰",
+                    colorHex = 0xFFF59E0B
+                )
             )
         }
 
@@ -136,7 +137,7 @@ class GameViewModel : ViewModel() {
         if (currentP.isDead) return
 
         if (currentP.currentAp <= 0) {
-            addLog("⚠️ Бракує пунктів дії (ОД)! Завершіть хід.")
+            triggerBanner("Немає ОД! Завершіть хід", "⏳", 0xFFEF4444)
             return
         }
 
@@ -146,7 +147,7 @@ class GameViewModel : ViewModel() {
 
         if (targetPos.x !in 0 until width || targetPos.y !in 0 until height) return
 
-        // Check if an enemy is at the target cell -> attack instead!
+        // If enemy at target cell -> attack
         val enemyAtTarget = dungeon.enemies.find { it.pos == targetPos && !it.isDead }
         if (enemyAtTarget != null) {
             attackEnemy(enemyAtTarget, _uiState.value.selectedSkill)
@@ -154,51 +155,49 @@ class GameViewModel : ViewModel() {
         }
 
         val tile = dungeon.tiles[targetPos.x][targetPos.y]
-        if (!tile.isWalkable) {
-            return
-        }
+        if (!tile.isWalkable) return
 
-        // Execute movement
         currentP.pos = targetPos
         currentP.currentAp--
         currentP.torchTurns = (currentP.torchTurns - 1).coerceAtLeast(0)
 
         SoundSynthesizer.playStep()
 
-        // Check loot
+        // Loot handling
         if (tile.scrapLoot > 0 || tile.biomassLoot > 0) {
             currentP.scrap += tile.scrapLoot
             currentP.biomass += tile.biomassLoot
-            addLog("💰 Підібрано залишки: +${tile.scrapLoot} Брухту, +${tile.biomassLoot} Біомаси.")
+            addFloatingFx(
+                gridX = targetPos.x,
+                gridY = targetPos.y,
+                text = "+${tile.scrapLoot} ⚙️  +${tile.biomassLoot} 🧬",
+                colorHex = 0xFFF59E0B
+            )
             tile.scrapLoot = 0
             tile.biomassLoot = 0
         }
 
-        // Elevator exit check
+        // Elevator exit
         if (tile.type == TileType.ELEVATOR_EXIT) {
             val nextFloor = _uiState.value.currentFloorNumber + 1
             if (nextFloor > 3) {
-                // Victory over the Factory God!
                 _uiState.update { it.copy(currentScreen = ScreenState.GAME_OVER, isVictory = true) }
                 return
             } else {
-                addLog("⏫ Шахта ліфта гуркоче, опускаючи вас глибше у безодню...")
                 loadFloor(nextFloor)
                 return
             }
         }
 
-        // Random chance of triggering sector's moral dilemma on discovery
-        if (dungeon.pendingDilemma != null && Math.random() < 0.08) {
+        // Moral dilemma chance
+        if (dungeon.pendingDilemma != null && Math.random() < 0.09) {
             val dilemma = dungeon.pendingDilemma
             dungeon.pendingDilemma = null
             _uiState.update { it.copy(activeDilemma = dilemma, currentScreen = ScreenState.DILEMMA_POPUP) }
             SoundSynthesizer.playEldritchDrone()
         }
 
-        // Recalculate FOV
         DungeonGenerator.calculateFov(dungeon.tiles, currentP.pos, currentP.fovRadius)
-
         tickTimeAndEntropy()
 
         _uiState.update { it.copy(player = currentP.copy()) }
@@ -218,23 +217,53 @@ class GameViewModel : ViewModel() {
         if (player.isDead || enemy.isDead) return
 
         if (player.currentAp < skill.apCost) {
-            addLog("⚠️ Недостатньо ОД для [${skill.name}]! Потрібно ${skill.apCost} ОД.")
+            triggerBanner("Потрібно ${skill.apCost} ОД!", "⚠️", 0xFFEF4444)
             return
         }
 
         val dist = player.pos.chebyshevDistance(enemy.pos)
         if (dist > skill.range) {
-            addLog("⚠️ Ціль занадто далеко для [${skill.name}] (Дальність: ${skill.range}).")
+            triggerBanner("Поза досяжністю (${skill.range})", "🎯", 0xFF94A3B8)
             return
         }
 
         val result = CombatEngine.executePlayerAttack(player, enemy, skill, dungeon.tiles)
-        result.logs.forEach { addLog(it) }
+
+        // Visual damage popup over enemy
+        addFloatingFx(
+            gridX = enemy.pos.x,
+            gridY = enemy.pos.y,
+            text = if (result.isCritical) "💥 -${result.damageDealt}" else "-${result.damageDealt}",
+            colorHex = if (result.isCritical) 0xFFF59E0B else 0xFFDC2626,
+            isCrit = result.isCritical
+        )
+
+        // Visual heal popup over player if siphoned
+        if (result.playerHealed > 0) {
+            addFloatingFx(
+                gridX = player.pos.x,
+                gridY = player.pos.y,
+                text = "+${result.playerHealed} ❤️",
+                colorHex = 0xFF22C55E
+            )
+        }
 
         if (skill.id == SkillCatalog.strikeHeavy.id || skill.id == SkillCatalog.pistonSlam.id) {
             SoundSynthesizer.playHeavySlam()
         } else {
             SoundSynthesizer.playStrike()
+        }
+
+        if (result.enemyDied) {
+            addFloatingFx(
+                gridX = enemy.pos.x,
+                gridY = enemy.pos.y,
+                text = "💀 ЗНИЩЕНО",
+                colorHex = 0xFFA855F7
+            )
+            val harvest = HarvestCatalog.generateHarvestFor(enemy.archetype)
+            _uiState.update { it.copy(pendingHarvest = harvest) }
+            SoundSynthesizer.playMutationChime()
         }
 
         if (player.isDead) {
@@ -250,26 +279,88 @@ class GameViewModel : ViewModel() {
         }
     }
 
+    fun applyHarvestMutation(option: HarvestMutationOption) {
+        val player = _uiState.value.player
+
+        player.maxHp += option.bonusMaxHp
+        if (option.bonusMaxHp > 0) {
+            player.currentHp += option.bonusMaxHp
+        }
+        player.armor += option.bonusArmor
+        player.maxAp += option.bonusAp
+        player.currentAp += option.bonusAp
+        player.fovRadius += option.bonusFov
+        player.corruption = (player.corruption + option.corruptionDelta).coerceIn(0, player.maxCorruption)
+        player.sanity = (player.sanity + option.sanityDelta).coerceIn(0, player.maxSanity)
+        player.currentHp = (player.currentHp + option.healHp).coerceAtMost(player.maxHp)
+        player.scrap += option.bonusScrap
+        player.biomass += option.bonusBiomass
+
+        if (option.grantedSkill != null && player.knownSkills.none { it.id == option.grantedSkill.id }) {
+            player.knownSkills.add(option.grantedSkill)
+        }
+
+        val customMut = Mutation(
+            id = "harvest_${System.currentTimeMillis()}",
+            name = option.title,
+            description = option.subtitle,
+            category = option.category,
+            slot = option.slot,
+            tier = 1,
+            biomassCost = 0,
+            scrapCost = 0,
+            sanityCost = 0,
+            corruptionIncrease = option.corruptionDelta.coerceAtLeast(0),
+            bonusMaxHp = option.bonusMaxHp,
+            bonusArmor = option.bonusArmor,
+            bonusAttackPower = option.bonusAttackPower,
+            bonusAp = option.bonusAp,
+            bonusFov = option.bonusFov,
+            grantedSkillId = option.grantedSkill?.id,
+            passiveDescription = option.passiveTrait
+        )
+        player.activeMutations.add(customMut)
+
+        SoundSynthesizer.playMutationChime()
+        triggerBanner("Прищеплено: ${option.title}", "🧬", 0xFFA855F7)
+
+        _uiState.update { current ->
+            current.copy(
+                player = player.copy(),
+                pendingHarvest = null
+            )
+        }
+    }
+
+    fun dismissHarvest() {
+        _uiState.update { it.copy(pendingHarvest = null) }
+    }
+
     fun endTurn() {
         val dungeon = currentDungeon ?: return
         val player = _uiState.value.player
         if (player.isDead) return
 
-        addLog("⏳ Хід передано ворогам...")
-
-        // Enemy turns
-        val enemyLogs = mutableListOf<String>()
+        // Process enemy turns cleanly
         for (enemy in dungeon.enemies.filter { !it.isDead }) {
-            val logs = CombatEngine.processEnemyTurn(enemy, player, dungeon.tiles)
-            enemyLogs.addAll(logs)
+            val result = CombatEngine.processEnemyTurn(enemy, player, dungeon.tiles)
+            if (result.damageDealtToPlayer > 0) {
+                addFloatingFx(
+                    gridX = player.pos.x,
+                    gridY = player.pos.y,
+                    text = "-${result.damageDealtToPlayer} ❤️",
+                    colorHex = 0xFFDC2626
+                )
+            }
+            if (result.enemyDiedFromThorns) {
+                val harvest = HarvestCatalog.generateHarvestFor(enemy.archetype)
+                _uiState.update { it.copy(pendingHarvest = harvest) }
+                SoundSynthesizer.playMutationChime()
+            }
         }
-        enemyLogs.forEach { addLog(it) }
 
-        // Environmental status ticks
-        val envLogs = CombatEngine.tickStatusesAndEnvironment(player, dungeon.enemies, dungeon.tiles)
-        envLogs.forEach { addLog(it) }
+        CombatEngine.tickStatusesAndEnvironment(player, dungeon.enemies, dungeon.tiles)
 
-        // Restore Player AP
         var apRestored = player.maxAp
         if (player.activeMutations.any { it.id == "mut_clockwork_springs" } && _uiState.value.turnCount % 2 == 0) {
             apRestored++
@@ -301,15 +392,18 @@ class GameViewModel : ViewModel() {
             else -> TimePhase.TWILIGHT
         }
 
-        // Sanity drain during whispers
         val player = _uiState.value.player
+        if (newPhase != _uiState.value.timePhase) {
+            triggerBanner("Фаза: ${newPhase.title}", "⏱️", 0xFFA855F7)
+        }
+
         if (newPhase == TimePhase.HOUR_OF_WHISPERS && turns % 15 == 0) {
             player.sanity = (player.sanity - 3).coerceAtLeast(0)
-            addLog("🌀 Прадавній шепіт розриває думки... -3 Глузду.")
+            addFloatingFx(player.pos.x, player.pos.y, "-3 🧠", 0xFF38BDF8)
         }
         if (player.torchTurns <= 0 && turns % 5 == 0) {
             player.sanity = (player.sanity - 2).coerceAtLeast(0)
-            addLog("🌑 Непроглядна темрява сіє жах! -2 Глузду.")
+            addFloatingFx(player.pos.x, player.pos.y, "Темрява! -2 🧠", 0xFF38BDF8)
         }
 
         _uiState.update { it.copy(turnCount = turns, timePhase = newPhase) }
@@ -326,7 +420,6 @@ class GameViewModel : ViewModel() {
         player.biomass = (player.biomass + choice.biomassChange).coerceAtLeast(0)
         player.essence = (player.essence + choice.essenceChange).coerceAtLeast(0)
 
-        // Award mutation if given
         if (choice.rewardMutationId != null) {
             val mut = MutationCatalog.allMutations.find { it.id == choice.rewardMutationId }
             if (mut != null && player.activeMutations.none { it.id == mut.id }) {
@@ -334,14 +427,12 @@ class GameViewModel : ViewModel() {
             }
         }
 
-        // Update faction
         val currentFactions = _uiState.value.factionReputations.toMutableMap()
         if (choice.factionAffected != null) {
             val curr = currentFactions[choice.factionAffected] ?: 0
             currentFactions[choice.factionAffected] = curr + choice.factionReputationChange
         }
 
-        // Record chronicle
         val record = StoryRecord(
             floor = _uiState.value.currentFloorNumber,
             title = activeD.title,
@@ -349,8 +440,7 @@ class GameViewModel : ViewModel() {
             consequence = choice.consequenceStory
         )
 
-        addLog("📜 ВИБІР: ${choice.title}")
-        addLog(choice.consequenceStory)
+        triggerBanner("Рішення: ${choice.title}", "⚖️", 0xFFF59E0B)
 
         _uiState.update { current ->
             current.copy(
@@ -385,12 +475,11 @@ class GameViewModel : ViewModel() {
             }
             if (skill != null && player.knownSkills.none { it.id == skill.id }) {
                 player.knownSkills.add(skill)
-                addLog("✨ Розблоковано бойову здатність: [${skill.name}]!")
             }
         }
 
         SoundSynthesizer.playMutationChime()
-        addLog("🧬 Тіло зазнало мутації: [${mutation.name}].")
+        triggerBanner("Прищеплено: ${mutation.name}", "🧬", 0xFFA855F7)
         _uiState.update { it.copy(player = player.copy()) }
     }
 
@@ -411,14 +500,17 @@ class GameViewModel : ViewModel() {
             items.remove(found)
         }
 
-        addLog("🧪 Використано: ${item.name}.")
+        if (item.hpRestore > 0) addFloatingFx(player.pos.x, player.pos.y, "+${item.hpRestore} ❤️", 0xFF22C55E)
+        if (item.sanityRestore > 0) addFloatingFx(player.pos.x, player.pos.y, "+${item.sanityRestore} 🧠", 0xFF38BDF8)
+        if (item.torchAdd > 0) addFloatingFx(player.pos.x, player.pos.y, "+${item.torchAdd} 🔥", 0xFFF59E0B)
+
         _uiState.update { it.copy(player = player.copy(), availableInventory = items) }
     }
 
     fun craftItem(recipe: Recipe) {
         val player = _uiState.value.player
         if (player.scrap < recipe.scrapCost || player.biomass < recipe.biomassCost) {
-            addLog("⚠️ Недостатньо ресурсів для створення!")
+            triggerBanner("Недостатньо ресурсів для крафту!", "⚠️", 0xFFEF4444)
             return
         }
 
@@ -434,8 +526,8 @@ class GameViewModel : ViewModel() {
             items.add(recipe.producedItem.copy(quantity = 1))
         }
 
-        addLog("🛠️ Створено: [${recipe.resultItemName}].")
         SoundSynthesizer.playHeavySlam()
+        triggerBanner("Сковано: ${recipe.resultItemName}", "🛠️", 0xFFF59E0B)
         _uiState.update { it.copy(player = player.copy(), availableInventory = items) }
     }
 
@@ -443,9 +535,28 @@ class GameViewModel : ViewModel() {
         _uiState.update { it.copy(currentScreen = screen) }
     }
 
-    private fun addLog(text: String) {
+    private fun addFloatingFx(gridX: Int, gridY: Int, text: String, colorHex: Long, isCrit: Boolean = false) {
+        val fx = FloatingFx(
+            gridX = gridX,
+            gridY = gridY,
+            text = text,
+            colorHex = colorHex,
+            isCrit = isCrit
+        )
         _uiState.update { current ->
-            current.copy(logs = listOf(text) + current.logs.take(25))
+            // Keep recent FX (pruning older than 1.8 seconds)
+            val now = System.currentTimeMillis()
+            val fresh = current.floatingFxList.filter { now - it.startTime < 1800 } + fx
+            current.copy(floatingFxList = fresh)
+        }
+    }
+
+    private fun triggerBanner(text: String, icon: String, colorHex: Long) {
+        val banner = MilestoneBanner(text, icon, colorHex)
+        _uiState.update { it.copy(activeBanner = banner) }
+        viewModelScope.launch {
+            delay(2800)
+            _uiState.update { if (it.activeBanner == banner) it.copy(activeBanner = null) else it }
         }
     }
 }

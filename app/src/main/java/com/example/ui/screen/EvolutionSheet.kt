@@ -95,6 +95,33 @@ fun EvolutionSheet(
             }
         }
 
+        Spacer(modifier = Modifier.height(6.dp))
+
+        // Live modified character attributes
+        PixelCard(
+            modifier = Modifier.fillMaxWidth(),
+            borderColor = ForgeAmber.copy(alpha = 0.5f),
+            backgroundColor = SurfaceVariantIron
+        ) {
+            Text(
+                text = "ХАРАКТЕРИСТИКИ КІБОРГА-МУТАНТА:",
+                color = ForgeAmber,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Bold,
+                fontFamily = FontFamily.Monospace
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text("❤️ Макс ОЗ: ${player.maxHp}", color = BloodCrimson, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                Text("🛡️ Броня: ${player.totalArmor()}", color = SanityCyan, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                Text("⚔️ Атака: ${player.totalAttackPower()}", color = ForgeAmber, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                Text("⚡ ОД: ${player.maxAp}", color = ToxicGreen, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+            }
+        }
+
         Spacer(modifier = Modifier.height(10.dp))
 
         // Active Mutation Slots

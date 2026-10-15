@@ -9,7 +9,15 @@ data class Tile(
     var isVisible: Boolean = false,
     var hasBloodSplatter: Boolean = false,
     var scrapLoot: Int = 0,
-    var biomassLoot: Int = 0
+    var biomassLoot: Int = 0,
+    // 16-bit autotiling and decorative styling
+    var wallFrontFace: Boolean = false, // Has walkable floor directly to the south
+    var wallTopEdge: Boolean = false,   // Has floor or void to the north
+    var wallLeftEdge: Boolean = false,  // Has floor to the west
+    var wallRightEdge: Boolean = false, // Has floor to the east
+    var hasWallTorch: Boolean = false,  // Decorative wall sconce with flame
+    var floorVariation: Int = 0,        // 0: smooth, 1: cracked, 2: runic, 3: metal trim
+    var isPillar: Boolean = false       // Isolated column/pillar
 ) {
     val isWalkable: Boolean
         get() = type.isWalkable

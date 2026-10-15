@@ -91,6 +91,14 @@ fun MainGameScreen(
                             onChooseOption = { choice -> viewModel.chooseDilemmaOption(choice) }
                         )
                     }
+
+                    // Overlay post-victory biomechanical harvest mutation if active
+                    if (state.pendingHarvest != null) {
+                        HarvestDialog(
+                            harvest = state.pendingHarvest!!,
+                            onSelectOption = { opt -> viewModel.applyHarvestMutation(opt) }
+                        )
+                    }
                 }
             }
         }
@@ -168,7 +176,7 @@ private fun DungeonPlayLayout(
 
         Spacer(modifier = Modifier.height(4.dp))
 
-        // Center Area: Dungeon Canvas (weight 1f)
+        // Center Area: Dungeon Canvas (takes full responsive space for gameplay immersion)
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -179,6 +187,8 @@ private fun DungeonPlayLayout(
                 player = state.player,
                 enemies = state.enemies,
                 targetEnemyId = state.targetEnemyId,
+                floatingFxList = state.floatingFxList,
+                activeBanner = state.activeBanner,
                 onTileTap = { pos ->
                     val dx = (pos.x - state.player.pos.x).coerceIn(-1, 1)
                     val dy = (pos.y - state.player.pos.y).coerceIn(-1, 1)
@@ -188,30 +198,6 @@ private fun DungeonPlayLayout(
                 },
                 modifier = Modifier.fillMaxSize()
             )
-
-            // Mini Combat Log overlay at the bottom of the canvas
-            Box(
-                modifier = Modifier
-                    .align(Alignment.BottomStart)
-                    .fillMaxWidth()
-                    .height(46.dp)
-                    .background(VoidBlack.copy(alpha = 0.85f), CutCornerShape(topStart = 4.dp, topEnd = 4.dp))
-                    .border(1.dp, BorderMetal.copy(alpha = 0.5f), CutCornerShape(topStart = 4.dp, topEnd = 4.dp))
-                    .padding(horizontal = 8.dp, vertical = 2.dp)
-            ) {
-                val logListState = rememberLazyListState()
-                LazyColumn(state = logListState, modifier = Modifier.fillMaxSize()) {
-                    items(state.logs.take(3)) { log ->
-                        Text(
-                            text = log,
-                            color = BoneIvory,
-                            fontSize = 9.sp,
-                            fontFamily = FontFamily.Monospace,
-                            lineHeight = 12.sp
-                        )
-                    }
-                }
-            }
         }
 
         Spacer(modifier = Modifier.height(4.dp))

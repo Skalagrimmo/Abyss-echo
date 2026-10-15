@@ -62,11 +62,11 @@ fun CombatControls(
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier
                         .background(VoidBlack, CutCornerShape(3.dp))
-                        .border(1.dp, BloodCrimson, CutCornerShape(3.dp))
-                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                        .border(1.dp, BloodCrimson.copy(alpha = 0.7f), CutCornerShape(3.dp))
+                        .padding(horizontal = 8.dp, vertical = 3.dp)
                 ) {
                     Text(
-                        text = "ЦІЛЬ: ${targetEnemy.archetype.title}",
+                        text = "🎯 ${targetEnemy.archetype.title}",
                         color = BoneIvory,
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold,
@@ -74,22 +74,16 @@ fun CombatControls(
                     )
                     Spacer(modifier = Modifier.width(6.dp))
                     Text(
-                        text = "ОЗ: ${targetEnemy.currentHp}/${targetEnemy.maxHp}",
+                        text = "${targetEnemy.currentHp}/${targetEnemy.maxHp} ❤️",
                         color = BloodCrimson,
                         fontSize = 11.sp,
-                        fontFamily = FontFamily.Monospace
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        text = "(${targetEnemy.intent.type.desc})",
-                        color = ForgeAmber,
-                        fontSize = 9.sp,
+                        fontWeight = FontWeight.Bold,
                         fontFamily = FontFamily.Monospace
                     )
                 }
             } else {
                 Text(
-                    text = "Ворогів поблизу не помічено",
+                    text = "Спокій у секторі",
                     color = AshGrey,
                     fontSize = 11.sp,
                     fontFamily = FontFamily.Monospace
@@ -123,21 +117,14 @@ fun CombatControls(
             }
         }
 
-        Spacer(modifier = Modifier.height(6.dp))
+        Spacer(modifier = Modifier.height(4.dp))
 
         // Combo chain status
         ComboDisplay(comboStage = player.comboStage, comboHits = player.comboHits)
 
-        Spacer(modifier = Modifier.height(8.dp))
+        Spacer(modifier = Modifier.height(6.dp))
 
         // Skills bar
-        Text(
-            text = "АРСЕНАЛ ТА МУТАЦІЇ:",
-            color = AshGrey,
-            fontSize = 9.sp,
-            fontFamily = FontFamily.Monospace
-        )
-        Spacer(modifier = Modifier.height(4.dp))
         LazyRow(
             horizontalArrangement = Arrangement.spacedBy(6.dp),
             modifier = Modifier.fillMaxWidth()
@@ -170,8 +157,8 @@ fun CombatControls(
                         }
                         .padding(horizontal = 8.dp, vertical = 5.dp)
                 ) {
-                    Column {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column {
                             Text(
                                 text = skill.name,
                                 color = if (canAfford) BoneIvory else AshGrey,
@@ -179,18 +166,19 @@ fun CombatControls(
                                 fontWeight = FontWeight.Bold,
                                 fontFamily = FontFamily.Monospace
                             )
-                            Spacer(modifier = Modifier.width(4.dp))
                             Text(
-                                text = "[${skill.apCost} ОД]",
-                                color = SanityCyan,
+                                text = "⚔️${skill.baseDamage}  🎯${skill.range}",
+                                color = AshGrey,
                                 fontSize = 9.sp,
                                 fontFamily = FontFamily.Monospace
                             )
                         }
+                        Spacer(modifier = Modifier.width(6.dp))
                         Text(
-                            text = "Урон: ${skill.baseDamage} | Дальн: ${skill.range}",
-                            color = AshGrey,
-                            fontSize = 9.sp,
+                            text = "${skill.apCost}⚡",
+                            color = if (canAfford) SanityCyan else AshGrey,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
                             fontFamily = FontFamily.Monospace
                         )
                     }
