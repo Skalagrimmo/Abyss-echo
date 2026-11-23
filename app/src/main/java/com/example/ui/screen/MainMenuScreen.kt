@@ -22,19 +22,23 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.R
-import com.example.engine.SoundSynthesizer
 import com.example.model.Archetype
+import com.example.model.AudioUiState
+import com.example.ui.components.AudioMixerPanel
 import com.example.ui.components.PixelCard
 import com.example.ui.components.RetroButton
 import com.example.ui.theme.*
 
 @Composable
 fun MainMenuScreen(
+    audioState: AudioUiState,
+    onToggleMute: () -> Unit,
+    onMusicVolumeChange: (Float) -> Unit,
+    onSfxVolumeChange: (Float) -> Unit,
     onStartGame: (Archetype) -> Unit,
     modifier: Modifier = Modifier
 ) {
     var selectedArchetype by remember { mutableStateOf(Archetype.IRON_DESERTER) }
-    var isMuted by remember { mutableStateOf(SoundSynthesizer.isMuted) }
 
     Column(
         modifier = modifier
@@ -87,26 +91,17 @@ fun MainMenuScreen(
             textAlign = TextAlign.Center
         )
 
-        Spacer(modifier = Modifier.height(16.dp))
+        Spacer(modifier = Modifier.height(14.dp))
 
-        // Sound Toggle
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.End
-        ) {
-            RetroButton(
-                text = if (isMuted) "🔇 ЗВУК: ВИМК" else "🔊 ЗВУК: УВІМК",
-                onClick = {
-                    isMuted = !isMuted
-                    SoundSynthesizer.isMuted = isMuted
-                },
-                color = SurfaceVariantIron,
-                textColor = BoneIvory,
-                testTag = "btn_mute_toggle"
-            )
-        }
+        AudioMixerPanel(
+            audioState = audioState,
+            onToggleMute = onToggleMute,
+            onMusicVolumeChange = onMusicVolumeChange,
+            onSfxVolumeChange = onSfxVolumeChange,
+            showTrackHeader = false
+        )
 
-        Spacer(modifier = Modifier.height(10.dp))
+        Spacer(modifier = Modifier.height(12.dp))
 
         Text(
             text = "ОБЕРІТЬ АРХЕТИП ПЕРЕД СПУСКОМ:",

@@ -1,5 +1,6 @@
 package com.example.ui
 
+import android.content.Context
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
@@ -13,15 +14,22 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.engine.AmbientAudioEngine
 import com.example.model.Archetype
+import com.example.ui.components.AudioMixerOverlay
 import com.example.ui.components.PixelCard
 import com.example.ui.components.RetroStatBar
 import com.example.ui.components.TimePhaseBanner
+import com.example.ui.components.TrackIndicatorPill
 import com.example.ui.screen.*
 import com.example.ui.theme.*
 import com.example.viewmodel.GameViewModel
@@ -33,6 +41,49 @@ fun MainGameScreen(
     modifier: Modifier = Modifier
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val audioPrefs = remember(context) {
+        context.getSharedPreferences("echo_abyss_audio_prefs", Context.MODE_PRIVATE)
+    }
+    var prefsHydrated by remember { mutableStateOf(false) }
+
+    LaunchedEffect(audioPrefs) {
+        val musicVol = audioPrefs.getFloat("music_volume", 0.75f)
+        val sfxVol = audioPrefs.getFloat("sfx_volume", 0.85f)
+        val muted = audioPrefs.getBoolean("is_muted", false)
+        viewModel.applyPersistedAudioSettings(musicVol, sfxVol, muted)
+        AmbientAudioEngine.setProfile(state.audioState.activeProfile)
+        prefsHydrated = true
+    }
+
+    LaunchedEffect(
+        prefsHydrated,
+        state.audioState.musicVolume,
+        state.audioState.sfxVolume,
+        state.audioState.isMuted
+    ) {
+        if (!prefsHydrated) return@LaunchedEffect
+        audioPrefs.edit()
+            .putFloat("music_volume", state.audioState.musicVolume)
+            .putFloat("sfx_volume", state.audioState.sfxVolume)
+            .putBoolean("is_muted", state.audioState.isMuted)
+            .apply()
+    }
+
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_PAUSE, Lifecycle.Event.ON_STOP -> AmbientAudioEngine.pause()
+                Lifecycle.Event.ON_RESUME -> AmbientAudioEngine.resume()
+                else -> {}
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
 
     Scaffold(
         modifier = modifier.fillMaxSize(),
@@ -46,6 +97,10 @@ fun MainGameScreen(
             when (state.currentScreen) {
                 ScreenState.MAIN_MENU -> {
                     MainMenuScreen(
+                        audioState = state.audioState,
+                        onToggleMute = { viewModel.toggleMute() },
+                        onMusicVolumeChange = { viewModel.setMusicVolume(it) },
+                        onSfxVolumeChange = { viewModel.setSfxVolume(it) },
                         onStartGame = { arch -> viewModel.startNewGame(arch) }
                     )
                 }
@@ -58,7 +113,11 @@ fun MainGameScreen(
                 ScreenState.EVOLUTION_SCREEN -> {
                     EvolutionSheet(
                         player = state.player,
+                        activeSlotPulse = state.activeSlotPulse,
                         onAcquireMutation = { mut -> viewModel.acquireMutation(mut) },
+                        onIntegrateBioBank = { organId -> viewModel.integrateBioBankOrgan(organId) },
+                        onSalvageBioBank = { organId -> viewModel.salvageBioBankOrgan(organId) },
+                        onRemoveSlot = { slot -> viewModel.removeSlotMutation(slot) },
                         onBack = { viewModel.navigateTo(ScreenState.DUNGEON) }
                     )
                 }
@@ -96,9 +155,21 @@ fun MainGameScreen(
                     if (state.pendingHarvest != null) {
                         HarvestDialog(
                             harvest = state.pendingHarvest!!,
-                            onSelectOption = { opt -> viewModel.applyHarvestMutation(opt) }
+                            player = state.player,
+                            onSelectOption = { opt -> viewModel.applyHarvestMutation(opt) },
+                            onStoreInBioBank = { opt -> viewModel.storeHarvestOrganInBioBank(opt) }
                         )
                     }
+
+                    // Expandable HUD audio mixer overlay
+                    AudioMixerOverlay(
+                        visible = state.audioState.isMixerExpanded,
+                        audioState = state.audioState,
+                        onToggleMute = { viewModel.toggleMute() },
+                        onMusicVolumeChange = { viewModel.setMusicVolume(it) },
+                        onSfxVolumeChange = { viewModel.setSfxVolume(it) },
+                        onDismiss = { viewModel.dismissAudioMixer() }
+                    )
                 }
             }
         }
@@ -120,6 +191,14 @@ private fun DungeonPlayLayout(
         TimePhaseBanner(
             phase = state.timePhase,
             turnCount = state.turnCount
+        )
+
+        Spacer(modifier = Modifier.height(4.dp))
+
+        // Dynamic Biome Track & Combat Surge HUD Indicator
+        TrackIndicatorPill(
+            audioState = state.audioState,
+            onClick = { viewModel.toggleAudioMixer() }
         )
 
         Spacer(modifier = Modifier.height(4.dp))
@@ -186,15 +265,18 @@ private fun DungeonPlayLayout(
                 tiles = viewModel.currentDungeon?.tiles,
                 player = state.player,
                 enemies = state.enemies,
+                props = state.activeProps,
+                validTargetCells = state.validTargetCells,
+                selectedSkill = state.selectedSkill,
                 targetEnemyId = state.targetEnemyId,
                 floatingFxList = state.floatingFxList,
+                activeAttackFx = state.activeAttackFx,
+                activeExplosions = state.activeExplosions,
+                activeMutationSurges = state.activeMutationSurges,
+                activeEnemyAnims = state.activeEnemyAnims,
                 activeBanner = state.activeBanner,
                 onTileTap = { pos ->
-                    val dx = (pos.x - state.player.pos.x).coerceIn(-1, 1)
-                    val dy = (pos.y - state.player.pos.y).coerceIn(-1, 1)
-                    if (dx != 0 || dy != 0) {
-                        viewModel.movePlayer(dx, dy)
-                    }
+                    viewModel.handleTileClick(pos)
                 },
                 modifier = Modifier.fillMaxSize()
             )

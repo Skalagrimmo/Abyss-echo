@@ -42,9 +42,17 @@ data class GameUiState(
         sanity = 70
     ),
     val enemies: List<Enemy> = emptyList(),
+    val activeProps: List<TacticalProp> = emptyList(),
+    val validTargetCells: Set<GridPos> = emptySet(),
+    val blastFxPositions: List<GridPos> = emptyList(),
     val targetEnemyId: String? = null,
     val selectedSkill: CombatSkill = SkillCatalog.strikeLight,
     val floatingFxList: List<FloatingFx> = emptyList(),
+    val activeAttackFx: List<AttackVisualFx> = emptyList(),
+    val activeExplosions: List<ExplosionVisualFx> = emptyList(),
+    val activeMutationSurges: List<MutationSurgeFx> = emptyList(),
+    val activeSlotPulse: SlotIntegrationPulseFx? = null,
+    val activeEnemyAnims: List<EnemyAnimFx> = emptyList(),
     val activeBanner: MilestoneBanner? = null,
     val availableInventory: List<Item> = listOf(
         ItemCatalog.salve.copy(quantity = 2),
@@ -60,7 +68,8 @@ data class GameUiState(
         Faction.FORGOTTEN_REMNANTS to 0
     ),
     val isVictory: Boolean = false,
-    val deathReason: String = ""
+    val deathReason: String = "",
+    val audioState: AudioUiState = AudioUiState()
 )
 
 class GameViewModel : ViewModel() {
@@ -69,6 +78,8 @@ class GameViewModel : ViewModel() {
 
     var currentDungeon: DungeonFloor? = null
         private set
+
+    private var pendingReturnMutationSurge: Mutation? = null
 
     fun startNewGame(archetype: Archetype) {
         val player = Player(
@@ -109,6 +120,12 @@ class GameViewModel : ViewModel() {
         )
 
         DungeonGenerator.calculateFov(floor.tiles, player.pos, player.fovRadius)
+        val initialTargets = CombatEngine.getValidTargetCells(
+            player.pos,
+            _uiState.value.selectedSkill,
+            floor.tiles,
+            floor.props
+        )
 
         _uiState.update { current ->
             current.copy(
@@ -117,6 +134,8 @@ class GameViewModel : ViewModel() {
                 sectorTitle = floor.sectorName,
                 player = player,
                 enemies = floor.enemies,
+                activeProps = floor.props.filter { !it.isDead },
+                validTargetCells = initialTargets,
                 targetEnemyId = floor.enemies.firstOrNull()?.id,
                 activeDilemma = null,
                 floatingFxList = emptyList(),
@@ -129,6 +148,22 @@ class GameViewModel : ViewModel() {
         }
 
         SoundSynthesizer.playEldritchDrone()
+        syncDynamicAudio()
+    }
+
+    private fun refreshTacticalGrid(playerPos: GridPos? = null) {
+        val dungeon = currentDungeon ?: return
+        val pos = playerPos ?: _uiState.value.player.pos
+        val skill = _uiState.value.selectedSkill
+        val validTargets = CombatEngine.getValidTargetCells(pos, skill, dungeon.tiles, dungeon.props)
+        _uiState.update { current ->
+            current.copy(
+                activeProps = dungeon.props.filter { !it.isDead },
+                validTargetCells = validTargets,
+                enemies = dungeon.enemies.filter { !it.isDead }
+            )
+        }
+        syncDynamicAudio()
     }
 
     fun movePlayer(deltaX: Int, deltaY: Int) {
@@ -150,7 +185,15 @@ class GameViewModel : ViewModel() {
         // If enemy at target cell -> attack
         val enemyAtTarget = dungeon.enemies.find { it.pos == targetPos && !it.isDead }
         if (enemyAtTarget != null) {
-            attackEnemy(enemyAtTarget, _uiState.value.selectedSkill)
+            executeAttack(enemyAtTarget, targetPos, _uiState.value.selectedSkill)
+            return
+        }
+
+        // If blocking prop at target cell (barrel/crate) -> attack or alert
+        val propAtTarget = dungeon.props.find { !it.isDead && it.pos == targetPos }
+        if (propAtTarget != null && propAtTarget.type.blocksMovement) {
+            // Attack the obstacle/barrel directly
+            executeAttack(null, targetPos, _uiState.value.selectedSkill)
             return
         }
 
@@ -162,6 +205,25 @@ class GameViewModel : ViewModel() {
         currentP.torchTurns = (currentP.torchTurns - 1).coerceAtLeast(0)
 
         SoundSynthesizer.playStep()
+
+        // Trap interaction (Spikes or Steam Vent)
+        if (propAtTarget != null && !propAtTarget.type.blocksMovement) {
+            when (propAtTarget.type) {
+                TacticalPropType.SPIKE_PLATE -> {
+                    currentP.currentHp = (currentP.currentHp - 6).coerceAtLeast(1)
+                    currentP.statuses.add(StatusEffect(StatusEffectType.BLEEDING, 2))
+                    addFloatingFx(targetPos.x, targetPos.y, "-6 ⚙️ ШИПИ!", 0xFFEF4444)
+                    SoundSynthesizer.playStrike()
+                }
+                TacticalPropType.STEAM_PRESSURE_VENT -> {
+                    currentP.currentHp = (currentP.currentHp - 4).coerceAtLeast(1)
+                    currentP.statuses.add(StatusEffect(StatusEffectType.BURNING, 2))
+                    addFloatingFx(targetPos.x, targetPos.y, "-4 ♨️ ПАРА!", 0xFFF59E0B)
+                    SoundSynthesizer.playHeavySlam()
+                }
+                else -> {}
+            }
+        }
 
         // Loot handling
         if (tile.scrapLoot > 0 || tile.biomassLoot > 0) {
@@ -182,6 +244,7 @@ class GameViewModel : ViewModel() {
             val nextFloor = _uiState.value.currentFloorNumber + 1
             if (nextFloor > 3) {
                 _uiState.update { it.copy(currentScreen = ScreenState.GAME_OVER, isVictory = true) }
+                syncDynamicAudio()
                 return
             } else {
                 loadFloor(nextFloor)
@@ -201,44 +264,134 @@ class GameViewModel : ViewModel() {
         tickTimeAndEntropy()
 
         _uiState.update { it.copy(player = currentP.copy()) }
+        refreshTacticalGrid(currentP.pos)
     }
 
     fun selectSkill(skill: CombatSkill) {
         _uiState.update { it.copy(selectedSkill = skill) }
+        refreshTacticalGrid()
     }
 
     fun selectEnemyTarget(enemyId: String) {
         _uiState.update { it.copy(targetEnemyId = enemyId) }
     }
 
-    fun attackEnemy(enemy: Enemy, skill: CombatSkill) {
+    fun handleTileClick(pos: GridPos) {
         val dungeon = currentDungeon ?: return
         val player = _uiState.value.player
-        if (player.isDead || enemy.isDead) return
+        if (player.isDead) return
+
+        val enemyAtPos = dungeon.enemies.find { !it.isDead && it.pos == pos }
+        val propAtPos = dungeon.props.find { !it.isDead && it.pos == pos }
+        val currentSkill = _uiState.value.selectedSkill
+        val validTargets = _uiState.value.validTargetCells
+
+        // If tapped cell is in tactical attack range
+        if (validTargets.contains(pos)) {
+            if (enemyAtPos != null) {
+                selectEnemyTarget(enemyAtPos.id)
+                executeAttack(enemyAtPos, pos, currentSkill)
+                return
+            } else if (propAtPos != null) {
+                executeAttack(null, pos, currentSkill)
+                return
+            } else if (currentSkill.isAreaEffect) {
+                executeAttack(null, pos, currentSkill)
+                return
+            }
+        }
+
+        // If clicked on an enemy outside current skill range, select target
+        if (enemyAtPos != null) {
+            selectEnemyTarget(enemyAtPos.id)
+            return
+        }
+
+        // If adjacent cell and walkable, move player
+        val dist = player.pos.chebyshevDistance(pos)
+        if (dist == 1) {
+            movePlayer(pos.x - player.pos.x, pos.y - player.pos.y)
+        }
+    }
+
+    fun attackEnemy(enemy: Enemy, skill: CombatSkill) {
+        executeAttack(enemy, enemy.pos, skill)
+    }
+
+    fun attackCell(targetPos: GridPos, skill: CombatSkill) {
+        val dungeon = currentDungeon ?: return
+        val enemy = dungeon.enemies.find { !it.isDead && it.pos == targetPos }
+        executeAttack(enemy, targetPos, skill)
+    }
+
+    fun executeAttack(enemy: Enemy?, targetPos: GridPos, skill: CombatSkill) {
+        val dungeon = currentDungeon ?: return
+        val player = _uiState.value.player
+        if (player.isDead) return
 
         if (player.currentAp < skill.apCost) {
             triggerBanner("Потрібно ${skill.apCost} ОД!", "⚠️", 0xFFEF4444)
             return
         }
 
-        val dist = player.pos.chebyshevDistance(enemy.pos)
-        if (dist > skill.range) {
-            triggerBanner("Поза досяжністю (${skill.range})", "🎯", 0xFF94A3B8)
+        val validTargets = CombatEngine.getValidTargetCells(player.pos, skill, dungeon.tiles, dungeon.props)
+        if (!validTargets.contains(targetPos)) {
+            val dist = player.pos.chebyshevDistance(targetPos)
+            if (dist > skill.range) {
+                triggerBanner("Поза досяжністю (${skill.range})", "🎯", 0xFF94A3B8)
+            } else {
+                triggerBanner("Немає прямої видимості!", "🚫", 0xFFEF4444)
+            }
             return
         }
 
-        val result = CombatEngine.executePlayerAttack(player, enemy, skill, dungeon.tiles)
-
-        // Visual damage popup over enemy
-        addFloatingFx(
-            gridX = enemy.pos.x,
-            gridY = enemy.pos.y,
-            text = if (result.isCritical) "💥 -${result.damageDealt}" else "-${result.damageDealt}",
-            colorHex = if (result.isCritical) 0xFFF59E0B else 0xFFDC2626,
-            isCrit = result.isCritical
+        val result = CombatEngine.executePlayerAttack(
+            player = player,
+            enemy = enemy,
+            targetPos = targetPos,
+            skill = skill,
+            tiles = dungeon.tiles,
+            props = dungeon.props,
+            enemies = dungeon.enemies
         )
 
-        // Visual heal popup over player if siphoned
+        // Visual damage popup
+        if (enemy != null && result.damageDealt > 0) {
+            addFloatingFx(
+                gridX = enemy.pos.x,
+                gridY = enemy.pos.y,
+                text = if (result.isCritical) "💥 -${result.damageDealt}" else "-${result.damageDealt}",
+                colorHex = if (result.isCritical) 0xFFF59E0B else 0xFFDC2626,
+                isCrit = result.isCritical
+            )
+        }
+
+        // Trigger attack animation
+        if (result.attackFx != null) {
+            addAttackFx(result.attackFx)
+        }
+        for (enemyFx in result.enemyAnimFxList) {
+            addEnemyAnimFx(enemyFx)
+        }
+
+        // Explosions FX and sounds
+        if (result.explosionHits.isNotEmpty()) {
+            SoundSynthesizer.playHeavySlam()
+            for (exp in result.explosionFxList) {
+                addExplosionFx(exp)
+            }
+            for (hitPos in result.explosionHits) {
+                addFloatingFx(
+                    gridX = hitPos.x,
+                    gridY = hitPos.y,
+                    text = "💥 БАБАХ!",
+                    colorHex = 0xFFF59E0B,
+                    isCrit = true
+                )
+            }
+        }
+
+        // Heal popup
         if (result.playerHealed > 0) {
             addFloatingFx(
                 gridX = player.pos.x,
@@ -248,13 +401,13 @@ class GameViewModel : ViewModel() {
             )
         }
 
-        if (skill.id == SkillCatalog.strikeHeavy.id || skill.id == SkillCatalog.pistonSlam.id) {
+        if (skill.id == SkillCatalog.strikeHeavy.id || skill.id == SkillCatalog.pistonSlam.id || result.explosionHits.isNotEmpty()) {
             SoundSynthesizer.playHeavySlam()
         } else {
             SoundSynthesizer.playStrike()
         }
 
-        if (result.enemyDied) {
+        if (result.enemyDied && enemy != null) {
             addFloatingFx(
                 gridX = enemy.pos.x,
                 gridY = enemy.pos.y,
@@ -268,61 +421,111 @@ class GameViewModel : ViewModel() {
 
         if (player.isDead) {
             _uiState.update { it.copy(currentScreen = ScreenState.GAME_OVER, deathReason = "Загибель у бою") }
+            syncDynamicAudio()
             return
         }
 
         _uiState.update { current ->
             current.copy(
                 player = player.copy(),
-                enemies = dungeon.enemies.filter { !it.isDead }
+                enemies = dungeon.enemies.filter { !it.isDead },
+                activeProps = dungeon.props.filter { !it.isDead },
+                blastFxPositions = result.explosionHits
+            )
+        }
+        refreshTacticalGrid(player.pos)
+    }
+
+    fun applyHarvestMutation(option: HarvestMutationOption) {
+        val harvest = _uiState.value.pendingHarvest
+        val player = _uiState.value.player
+
+        if (option.isResourceSalvage) {
+            player.corruption = (player.corruption + option.corruptionDelta).coerceIn(0, player.maxCorruption)
+            player.sanity = (player.sanity + option.sanityDelta).coerceIn(0, player.maxSanity)
+            player.currentHp = (player.currentHp + option.healHp).coerceAtMost(player.maxHp)
+            player.scrap += option.bonusScrap
+            player.biomass += option.bonusBiomass
+
+            SoundSynthesizer.playMutationChime()
+            triggerBanner("Перероблено: ${option.title}", "⚗️", 0xFF22C55E)
+            _uiState.update { current ->
+                current.copy(
+                    player = player.copy(),
+                    pendingHarvest = null
+                )
+            }
+            return
+        }
+
+        val mut = if (harvest != null) {
+            EvolutionEngine.convertHarvestOptionToMutation(harvest, option)
+        } else {
+            Mutation(
+                id = "organ_${option.trait.name.lowercase()}_${option.slot.name.lowercase()}",
+                name = option.title,
+                description = option.subtitle,
+                category = option.category,
+                slot = option.slot,
+                tier = 1,
+                biomassCost = 0,
+                scrapCost = 0,
+                sanityCost = 0,
+                corruptionIncrease = option.corruptionDelta.coerceAtLeast(0),
+                bonusMaxHp = option.bonusMaxHp,
+                bonusArmor = option.bonusArmor,
+                bonusAttackPower = option.bonusAttackPower,
+                bonusAp = option.bonusAp,
+                bonusFov = option.bonusFov,
+                grantedSkillId = option.grantedSkill?.id,
+                passiveDescription = option.passiveTrait ?: option.trait.passiveSummary,
+                trait = option.trait
+            )
+        }
+
+        val outcome = EvolutionEngine.integrateMutation(player, mut, deductCosts = false)
+        if (!outcome.success) {
+            // Slot already at Rank III: automatically salvage resources instead of losing trophy
+            player.biomass += 10
+            player.scrap += 6
+            triggerBanner("Слот III рангу — утилізовано (+10 біо / +6 брухту)", "♻️", 0xFFF59E0B)
+        } else {
+            player.sanity = (player.sanity + option.sanityDelta).coerceIn(0, player.maxSanity)
+            player.currentHp = (player.currentHp + option.healHp).coerceAtMost(player.maxHp)
+            player.scrap += option.bonusScrap
+            player.biomass += option.bonusBiomass
+
+            val bannerText = if (outcome.unlockedSynergyTitle != null) {
+                "${outcome.message} • Синергія: ${outcome.unlockedSynergyTitle}"
+            } else {
+                outcome.message
+            }
+            triggerBanner(bannerText, "🧬", branchColorHex(mut.category))
+            emitOrganIntegrationFx(
+                mutation = outcome.resultingMutation ?: mut,
+                isUpgrade = outcome.actionType == EvolutionActionType.UPGRADED_RANK
+            )
+        }
+
+        SoundSynthesizer.playMutationChime()
+        _uiState.update { current ->
+            current.copy(
+                player = player.copy(),
+                pendingHarvest = null
             )
         }
     }
 
-    fun applyHarvestMutation(option: HarvestMutationOption) {
+    fun storeHarvestOrganInBioBank(option: HarvestMutationOption) {
+        val harvest = _uiState.value.pendingHarvest ?: return
+        if (option.isResourceSalvage) {
+            applyHarvestMutation(option)
+            return
+        }
         val player = _uiState.value.player
-
-        player.maxHp += option.bonusMaxHp
-        if (option.bonusMaxHp > 0) {
-            player.currentHp += option.bonusMaxHp
-        }
-        player.armor += option.bonusArmor
-        player.maxAp += option.bonusAp
-        player.currentAp += option.bonusAp
-        player.fovRadius += option.bonusFov
-        player.corruption = (player.corruption + option.corruptionDelta).coerceIn(0, player.maxCorruption)
-        player.sanity = (player.sanity + option.sanityDelta).coerceIn(0, player.maxSanity)
-        player.currentHp = (player.currentHp + option.healHp).coerceAtMost(player.maxHp)
-        player.scrap += option.bonusScrap
-        player.biomass += option.bonusBiomass
-
-        if (option.grantedSkill != null && player.knownSkills.none { it.id == option.grantedSkill.id }) {
-            player.knownSkills.add(option.grantedSkill)
-        }
-
-        val customMut = Mutation(
-            id = "harvest_${System.currentTimeMillis()}",
-            name = option.title,
-            description = option.subtitle,
-            category = option.category,
-            slot = option.slot,
-            tier = 1,
-            biomassCost = 0,
-            scrapCost = 0,
-            sanityCost = 0,
-            corruptionIncrease = option.corruptionDelta.coerceAtLeast(0),
-            bonusMaxHp = option.bonusMaxHp,
-            bonusArmor = option.bonusArmor,
-            bonusAttackPower = option.bonusAttackPower,
-            bonusAp = option.bonusAp,
-            bonusFov = option.bonusFov,
-            grantedSkillId = option.grantedSkill?.id,
-            passiveDescription = option.passiveTrait
-        )
-        player.activeMutations.add(customMut)
-
+        val stored = EvolutionEngine.storeHarvestedOrganInBioBank(player, harvest, option)
         SoundSynthesizer.playMutationChime()
-        triggerBanner("Прищеплено: ${option.title}", "🧬", 0xFFA855F7)
+        triggerBanner("У Біо-банк: ${stored.name}", "🧫", 0xFF06B6D4)
 
         _uiState.update { current ->
             current.copy(
@@ -330,6 +533,50 @@ class GameViewModel : ViewModel() {
                 pendingHarvest = null
             )
         }
+    }
+
+    fun integrateBioBankOrgan(organId: String) {
+        val player = _uiState.value.player
+        val outcome = EvolutionEngine.integrateBioBankOrgan(player, organId)
+        if (outcome.success) {
+            SoundSynthesizer.playMutationChime()
+            val resulting = outcome.resultingMutation
+            val text = if (outcome.unlockedSynergyTitle != null) {
+                "${outcome.message} • ${outcome.unlockedSynergyTitle}"
+            } else {
+                outcome.message
+            }
+            triggerBanner(text, "🧬", branchColorHex(resulting?.category ?: MutationCategory.CHTHONIC_FLESH))
+            if (resulting != null) {
+                emitOrganIntegrationFx(
+                    mutation = resulting,
+                    isUpgrade = outcome.actionType == EvolutionActionType.UPGRADED_RANK
+                )
+            }
+        } else {
+            triggerBanner(outcome.message, "⚠️", 0xFFF59E0B)
+        }
+        _uiState.update { it.copy(player = player.copy()) }
+    }
+
+    fun salvageBioBankOrgan(organId: String) {
+        val player = _uiState.value.player
+        val (bio, scrap) = EvolutionEngine.salvageBioBankOrgan(player, organId)
+        if (bio > 0 || scrap > 0) {
+            SoundSynthesizer.playStrike()
+            triggerBanner("Утилізація: +$bio біомаси, +$scrap брухту", "♻️", 0xFF22C55E)
+        }
+        _uiState.update { it.copy(player = player.copy()) }
+    }
+
+    fun removeSlotMutation(slot: MutationSlot) {
+        val player = _uiState.value.player
+        val (bio, scrap) = EvolutionEngine.removeEquippedMutation(player, slot)
+        if (bio > 0 || scrap > 0) {
+            SoundSynthesizer.playStrike()
+            triggerBanner("Вилучено слот [${slot.title}]: +$bio біо / +$scrap брухту", "🔬", 0xFF94A3B8)
+        }
+        _uiState.update { it.copy(player = player.copy()) }
     }
 
     fun dismissHarvest() {
@@ -341,9 +588,15 @@ class GameViewModel : ViewModel() {
         val player = _uiState.value.player
         if (player.isDead) return
 
-        // Process enemy turns cleanly
+        // Process enemy turns cleanly with props blocking
         for (enemy in dungeon.enemies.filter { !it.isDead }) {
-            val result = CombatEngine.processEnemyTurn(enemy, player, dungeon.tiles)
+            val result = CombatEngine.processEnemyTurn(enemy, player, dungeon.tiles, dungeon.props)
+            if (result.attackFx != null) {
+                addAttackFx(result.attackFx)
+            }
+            if (result.enemyAnimFx != null) {
+                addEnemyAnimFx(result.enemyAnimFx)
+            }
             if (result.damageDealtToPlayer > 0) {
                 addFloatingFx(
                     gridX = player.pos.x,
@@ -359,18 +612,51 @@ class GameViewModel : ViewModel() {
             }
         }
 
-        CombatEngine.tickStatusesAndEnvironment(player, dungeon.enemies, dungeon.tiles)
+        CombatEngine.tickStatusesAndEnvironment(player, dungeon.enemies, dungeon.tiles, dungeon.props)
 
         var apRestored = player.maxAp
-        if (player.activeMutations.any { it.id == "mut_clockwork_springs" } && _uiState.value.turnCount % 2 == 0) {
+        val clockworkRank = EvolutionEngine.getTraitRank(player, EvolutionTrait.CLOCKWORK_AP)
+        val steelApex = EvolutionEngine.isApexSynergyActive(player, MutationCategory.IRON_CYBERNETICS)
+        if (clockworkRank >= 3) {
+            apRestored++
+        } else if ((clockworkRank > 0 || steelApex) && _uiState.value.turnCount % 2 == 0) {
             apRestored++
         }
         player.currentAp = apRestored
+
+        // Trigger biomechanical mutation surge effect for turn
+        if (player.activeMutations.isNotEmpty()) {
+            val turn = _uiState.value.turnCount + 1
+            val activeMut = player.activeMutations[turn % player.activeMutations.size]
+            val glyph = when (activeMut.slot) {
+                MutationSlot.HEAD -> "👁️"
+                MutationSlot.ARMS -> "⚔️"
+                MutationSlot.TORSO -> "🛡️"
+                MutationSlot.LEGS -> "⚡"
+                MutationSlot.CORE -> "🧬"
+            }
+            val color = when (activeMut.slot) {
+                MutationSlot.CORE -> 0xFF8B5CF6
+                MutationSlot.ARMS -> 0xFFEF4444
+                MutationSlot.TORSO -> 0xFFF59E0B
+                MutationSlot.HEAD -> 0xFF06B6D4
+                MutationSlot.LEGS -> 0xFF10B981
+            }
+            addMutationSurgeFx(
+                MutationSurgeFx(
+                    playerPos = player.pos,
+                    mutationName = activeMut.name,
+                    runeGlyph = glyph,
+                    colorHex = color
+                )
+            )
+        }
 
         tickTimeAndEntropy()
 
         if (player.isDead) {
             _uiState.update { it.copy(currentScreen = ScreenState.GAME_OVER, deathReason = "Знекровлення у надрах") }
+            syncDynamicAudio()
             return
         }
 
@@ -378,9 +664,11 @@ class GameViewModel : ViewModel() {
             current.copy(
                 turnCount = current.turnCount + 1,
                 player = player.copy(),
-                enemies = dungeon.enemies.filter { !it.isDead }
+                enemies = dungeon.enemies.filter { !it.isDead },
+                activeProps = dungeon.props.filter { !it.isDead }
             )
         }
+        refreshTacticalGrid(player.pos)
     }
 
     private fun tickTimeAndEntropy() {
@@ -422,8 +710,8 @@ class GameViewModel : ViewModel() {
 
         if (choice.rewardMutationId != null) {
             val mut = MutationCatalog.allMutations.find { it.id == choice.rewardMutationId }
-            if (mut != null && player.activeMutations.none { it.id == mut.id }) {
-                acquireMutation(mut)
+            if (mut != null) {
+                acquireMutation(mut, deductCosts = false)
             }
         }
 
@@ -453,34 +741,26 @@ class GameViewModel : ViewModel() {
         }
     }
 
-    fun acquireMutation(mutation: Mutation) {
+    fun acquireMutation(mutation: Mutation, deductCosts: Boolean = true) {
         val player = _uiState.value.player
-        if (player.activeMutations.any { it.id == mutation.id }) return
-
-        player.activeMutations.add(mutation)
-        player.maxHp += mutation.bonusMaxHp
-        player.currentHp = (player.currentHp + mutation.bonusMaxHp).coerceAtMost(player.maxHp)
-        player.armor += mutation.bonusArmor
-        player.fovRadius += mutation.bonusFov
-        player.corruption = (player.corruption + mutation.corruptionIncrease).coerceAtMost(player.maxCorruption)
-
-        if (mutation.grantedSkillId != null) {
-            val skill = when (mutation.grantedSkillId) {
-                "skill_siphon_lash" -> SkillCatalog.siphonLash
-                "skill_piston_slam" -> SkillCatalog.pistonSlam
-                "skill_steam_vent" -> SkillCatalog.steamVent
-                "skill_blood_lance" -> SkillCatalog.bloodLance
-                "skill_void_gaze" -> SkillCatalog.voidGaze
-                else -> null
+        val outcome = EvolutionEngine.integrateMutation(player, mutation, deductCosts = deductCosts)
+        if (outcome.success) {
+            SoundSynthesizer.playMutationChime()
+            val resulting = outcome.resultingMutation ?: mutation
+            val text = if (outcome.unlockedSynergyTitle != null) {
+                "${outcome.message} • ${outcome.unlockedSynergyTitle}"
+            } else {
+                outcome.message
             }
-            if (skill != null && player.knownSkills.none { it.id == skill.id }) {
-                player.knownSkills.add(skill)
-            }
+            triggerBanner(text, "🧬", branchColorHex(resulting.category))
+            emitOrganIntegrationFx(
+                mutation = resulting,
+                isUpgrade = outcome.actionType == EvolutionActionType.UPGRADED_RANK
+            )
+            _uiState.update { it.copy(player = player.copy()) }
+        } else {
+            triggerBanner(outcome.message, "⚠️", 0xFFEF4444)
         }
-
-        SoundSynthesizer.playMutationChime()
-        triggerBanner("Прищеплено: ${mutation.name}", "🧬", 0xFFA855F7)
-        _uiState.update { it.copy(player = player.copy()) }
     }
 
     fun useItem(item: Item) {
@@ -533,6 +813,192 @@ class GameViewModel : ViewModel() {
 
     fun navigateTo(screen: ScreenState) {
         _uiState.update { it.copy(currentScreen = screen) }
+        if (screen == ScreenState.DUNGEON) {
+            val queued = pendingReturnMutationSurge
+            if (queued != null) {
+                pendingReturnMutationSurge = null
+                triggerMapMutationSurge(queued)
+            }
+        }
+        syncDynamicAudio()
+    }
+
+    fun setMusicVolume(volume: Float) {
+        val clamped = volume.coerceIn(0f, 1f)
+        AmbientAudioEngine.setMusicVolume(clamped)
+        _uiState.update { it.copy(audioState = it.audioState.copy(musicVolume = clamped)) }
+    }
+
+    fun setSfxVolume(volume: Float) {
+        val clamped = volume.coerceIn(0f, 1f)
+        SoundSynthesizer.sfxVolume = clamped
+        _uiState.update { it.copy(audioState = it.audioState.copy(sfxVolume = clamped)) }
+    }
+
+    fun toggleMute() {
+        val nextMuted = !_uiState.value.audioState.isMuted
+        SoundSynthesizer.isMuted = nextMuted
+        AmbientAudioEngine.setMuted(nextMuted)
+        _uiState.update { it.copy(audioState = it.audioState.copy(isMuted = nextMuted)) }
+    }
+
+    fun applyPersistedAudioSettings(musicVolume: Float, sfxVolume: Float, isMuted: Boolean) {
+        val clampedMusic = musicVolume.coerceIn(0f, 1f)
+        val clampedSfx = sfxVolume.coerceIn(0f, 1f)
+        SoundSynthesizer.sfxVolume = clampedSfx
+        SoundSynthesizer.isMuted = isMuted
+        AmbientAudioEngine.setMusicVolume(clampedMusic)
+        AmbientAudioEngine.setMuted(isMuted)
+        _uiState.update {
+            it.copy(
+                audioState = it.audioState.copy(
+                    musicVolume = clampedMusic,
+                    sfxVolume = clampedSfx,
+                    isMuted = isMuted
+                )
+            )
+        }
+    }
+
+    fun toggleAudioMixer() {
+        _uiState.update {
+            it.copy(audioState = it.audioState.copy(isMixerExpanded = !it.audioState.isMixerExpanded))
+        }
+    }
+
+    fun dismissAudioMixer() {
+        if (_uiState.value.audioState.isMixerExpanded) {
+            _uiState.update {
+                it.copy(audioState = it.audioState.copy(isMixerExpanded = false))
+            }
+        }
+    }
+
+    fun computeCombatIntensity(): Float {
+        val state = _uiState.value
+        val dungeon = currentDungeon ?: return 0f
+        if (state.currentScreen == ScreenState.MAIN_MENU || state.currentScreen == ScreenState.GAME_OVER) {
+            return 0f
+        }
+
+        val player = state.player
+        val tiles = dungeon.tiles
+        val aliveEnemies = dungeon.enemies.filter { !it.isDead }
+
+        var intensity = 0f
+        val visibleEnemies = aliveEnemies.filter { enemy ->
+            val inBounds = enemy.pos.x in tiles.indices && enemy.pos.y in tiles[0].indices
+            val isVisible = inBounds && tiles[enemy.pos.x][enemy.pos.y].isVisible
+            val dist = player.pos.chebyshevDistance(enemy.pos)
+            isVisible || dist <= 4
+        }
+
+        if (visibleEnemies.isNotEmpty()) {
+            val minDist = visibleEnemies.minOf { player.pos.chebyshevDistance(it.pos) }
+            val hasBoss = visibleEnemies.any {
+                it.archetype == EnemyArchetype.CRUCIBLE_TITAN
+            }
+            intensity += when {
+                hasBoss -> 0.85f
+                minDist <= 2 -> 0.70f
+                else -> 0.45f
+            }
+            intensity += ((visibleEnemies.size - 1) * 0.12f).coerceAtMost(0.30f)
+        }
+
+        val hpRatio = player.currentHp.toFloat() / player.maxHp.coerceAtLeast(1)
+        if (hpRatio <= 0.35f) {
+            intensity += 0.20f
+        }
+
+        intensity += when (state.timePhase) {
+            TimePhase.HOUR_OF_WHISPERS -> 0.10f
+            TimePhase.AWAKENING_OF_GOD -> 0.25f
+            else -> 0f
+        }
+
+        return intensity.coerceIn(0f, 1f)
+    }
+
+    private fun resolveAudioProfile(): AmbientTrackProfile {
+        val state = _uiState.value
+        if (state.currentScreen == ScreenState.MAIN_MENU || state.currentScreen == ScreenState.GAME_OVER) {
+            return AmbientTrackProfile.VOID_MENU
+        }
+        val biome = currentDungeon?.biome ?: DungeonGenerator.biomeForFloor(state.currentFloorNumber)
+        return AmbientTrackProfile.fromBiome(biome)
+    }
+
+    private fun syncDynamicAudio() {
+        val profile = resolveAudioProfile()
+        val intensity = computeCombatIntensity()
+        val audio = _uiState.value.audioState
+
+        AmbientAudioEngine.setProfile(profile)
+        AmbientAudioEngine.setCombatIntensity(intensity)
+        AmbientAudioEngine.setMusicVolume(audio.musicVolume)
+        AmbientAudioEngine.setMuted(audio.isMuted)
+        SoundSynthesizer.sfxVolume = audio.sfxVolume
+        SoundSynthesizer.isMuted = audio.isMuted
+
+        _uiState.update { current ->
+            current.copy(
+                audioState = current.audioState.copy(
+                    activeProfile = profile,
+                    combatIntensity = intensity
+                )
+            )
+        }
+    }
+
+    private fun branchColorHex(category: MutationCategory): Long = when (category) {
+        MutationCategory.CHTHONIC_FLESH -> 0xFF22C55E
+        MutationCategory.IRON_CYBERNETICS -> 0xFFF59E0B
+        MutationCategory.OCCULT_SIGIL -> 0xFFA855F7
+    }
+
+    private fun branchGlyph(category: MutationCategory): String = when (category) {
+        MutationCategory.CHTHONIC_FLESH -> "🧬"
+        MutationCategory.IRON_CYBERNETICS -> "⚙️"
+        MutationCategory.OCCULT_SIGIL -> "👁️"
+    }
+
+    private fun triggerMapMutationSurge(mutation: Mutation) {
+        val player = _uiState.value.player
+        addMutationSurgeFx(
+            MutationSurgeFx(
+                playerPos = player.pos,
+                mutationName = mutation.name,
+                runeGlyph = branchGlyph(mutation.category),
+                colorHex = branchColorHex(mutation.category)
+            )
+        )
+    }
+
+    private fun emitOrganIntegrationFx(mutation: Mutation, isUpgrade: Boolean) {
+        val pulse = SlotIntegrationPulseFx(
+            slot = mutation.slot,
+            category = mutation.category,
+            isUpgrade = isUpgrade,
+            tier = mutation.tier
+        )
+        _uiState.update { it.copy(activeSlotPulse = pulse) }
+        viewModelScope.launch {
+            delay(pulse.durationMs + 80)
+            _uiState.update { current ->
+                if (current.activeSlotPulse?.id == pulse.id) {
+                    current.copy(activeSlotPulse = null)
+                } else {
+                    current
+                }
+            }
+        }
+
+        if (_uiState.value.currentScreen == ScreenState.EVOLUTION_SCREEN) {
+            pendingReturnMutationSurge = mutation
+        } else {
+            triggerMapMutationSurge(mutation)
+        }
     }
 
     private fun addFloatingFx(gridX: Int, gridY: Int, text: String, colorHex: Long, isCrit: Boolean = false) {
@@ -548,6 +1014,64 @@ class GameViewModel : ViewModel() {
             val now = System.currentTimeMillis()
             val fresh = current.floatingFxList.filter { now - it.startTime < 1800 } + fx
             current.copy(floatingFxList = fresh)
+        }
+    }
+
+    fun addAttackFx(fx: AttackVisualFx) {
+        _uiState.update { current ->
+            val now = System.currentTimeMillis()
+            val fresh = current.activeAttackFx.filter { now - it.startTime < it.durationMs + 100 } + fx
+            current.copy(activeAttackFx = fresh)
+        }
+        viewModelScope.launch {
+            delay(fx.durationMs + 50)
+            _uiState.update { current ->
+                current.copy(activeAttackFx = current.activeAttackFx.filter { it.id != fx.id })
+            }
+        }
+    }
+
+    fun addExplosionFx(fx: ExplosionVisualFx) {
+        _uiState.update { current ->
+            val now = System.currentTimeMillis()
+            val fresh = current.activeExplosions.filter { now - it.startTime < it.durationMs + 100 } + fx
+            current.copy(activeExplosions = fresh)
+        }
+        viewModelScope.launch {
+            delay(fx.durationMs + 50)
+            _uiState.update { current ->
+                current.copy(activeExplosions = current.activeExplosions.filter { it.id != fx.id })
+            }
+        }
+    }
+
+    fun addMutationSurgeFx(fx: MutationSurgeFx) {
+        _uiState.update { current ->
+            val now = System.currentTimeMillis()
+            val fresh = current.activeMutationSurges.filter { now - it.startTime < it.durationMs + 100 } + fx
+            current.copy(activeMutationSurges = fresh)
+        }
+        viewModelScope.launch {
+            delay(fx.durationMs + 50)
+            _uiState.update { current ->
+                current.copy(activeMutationSurges = current.activeMutationSurges.filter { it.id != fx.id })
+            }
+        }
+    }
+
+    fun addEnemyAnimFx(fx: EnemyAnimFx) {
+        _uiState.update { current ->
+            val now = System.currentTimeMillis()
+            val fresh = current.activeEnemyAnims.filter {
+                now - it.startTime < it.durationMs + 100 && it.enemyId != fx.enemyId
+            } + fx
+            current.copy(activeEnemyAnims = fresh)
+        }
+        viewModelScope.launch {
+            delay(fx.durationMs + 50)
+            _uiState.update { current ->
+                current.copy(activeEnemyAnims = current.activeEnemyAnims.filter { it.id != fx.id })
+            }
         }
     }
 

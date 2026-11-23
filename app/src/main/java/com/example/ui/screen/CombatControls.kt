@@ -166,9 +166,15 @@ fun CombatControls(
                                 fontWeight = FontWeight.Bold,
                                 fontFamily = FontFamily.Monospace
                             )
+                            val distBadge = when (skill.distanceType) {
+                                AttackDistanceType.MELEE -> "⚔️1"
+                                AttackDistanceType.REACH -> "🗡️2"
+                                AttackDistanceType.RANGED -> "🎯${skill.range}"
+                                AttackDistanceType.AREA -> "💥${skill.areaRadius * 2 + 1}x${skill.areaRadius * 2 + 1}"
+                            }
                             Text(
-                                text = "⚔️${skill.baseDamage}  🎯${skill.range}",
-                                color = AshGrey,
+                                text = "[$distBadge] ⚔️${skill.baseDamage}",
+                                color = if (isSelected) ForgeAmber else AshGrey,
                                 fontSize = 9.sp,
                                 fontFamily = FontFamily.Monospace
                             )

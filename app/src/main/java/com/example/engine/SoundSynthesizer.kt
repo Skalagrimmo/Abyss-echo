@@ -12,7 +12,10 @@ import kotlin.math.sin
 
 object SoundSynthesizer {
     private const val SAMPLE_RATE = 22050
+    @Volatile
     var isMuted: Boolean = false
+    @Volatile
+    var sfxVolume: Float = 0.85f
 
     private val audioScope = CoroutineScope(Dispatchers.IO)
     private val soundQueue = Channel<ShortArray>(capacity = 4)
@@ -56,12 +59,20 @@ object SoundSynthesizer {
                 activeTrack.play()
 
                 for (buffer in soundQueue) {
-                    if (!isMuted) {
-                        activeTrack.write(buffer, 0, buffer.size)
+                    val gain = sfxVolume.coerceIn(0f, 1f)
+                    if (!isMuted && gain > 0.01f) {
+                        if (gain >= 0.99f) {
+                            activeTrack.write(buffer, 0, buffer.size)
+                        } else {
+                            val scaled = ShortArray(buffer.size) { idx ->
+                                (buffer[idx] * gain).toInt().toShort()
+                            }
+                            activeTrack.write(scaled, 0, scaled.size)
+                        }
                     }
                 }
-            } catch (_: Exception) {
-                // Fallback for restricted containers
+            } catch (_: Throwable) {
+                // Fallback for restricted containers or JVM tests
             } finally {
                 try {
                     activeTrack?.stop()

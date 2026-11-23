@@ -132,3 +132,18 @@ enum class Archetype(
         65, 80, 15, 15
     )
 }
+
+enum class TilesetBiome(val title: String) {
+    FLESH("Некро-Катакомби Плоті"),
+    STEEL("Шлакова Мануфактура Сталі"),
+    CRUCIBLE("Хтонічне Горнило Безодні")
+}
+
+enum class BiomechDecal {
+    NONE,
+    FLESH_VEINS,
+    COPPER_PIPE,
+    RIVET_PLATE,
+    BONE_RIBS,
+    RUNIC_SEAM
+}

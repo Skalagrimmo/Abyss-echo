@@ -2,15 +2,18 @@ package com.example.engine
 
 import com.example.model.*
 import java.util.ArrayDeque
+import kotlin.math.abs
 import kotlin.random.Random
 
 data class DungeonFloor(
     val floorNumber: Int,
     val sectorName: String,
+    val biome: TilesetBiome = TilesetBiome.FLESH,
     val width: Int,
     val height: Int,
     val tiles: Array<Array<Tile>>,
     val enemies: MutableList<Enemy>,
+    val props: MutableList<TacticalProp> = mutableListOf(),
     val playerStart: GridPos,
     val exitPos: GridPos,
     var pendingDilemma: MoralDilemma? = null
@@ -18,165 +21,165 @@ data class DungeonFloor(
 
 object DungeonGenerator {
 
-    private enum class RoomType {
-        STANDARD_CHAMBER,
-        PILLARED_SANCTUARY,
-        FLOODED_CISTERN,
-        SMELTER_TRENCH,
-        CRUCIBLE_ARENA
-    }
-
     private data class Room(
         val x: Int,
         val y: Int,
         val w: Int,
         val h: Int,
-        val type: RoomType
+        val isStart: Boolean = false
     ) {
         val centerX: Int get() = x + w / 2
         val centerY: Int get() = y + h / 2
+    }
 
-        fun intersects(other: Room, padding: Int = 1): Boolean {
-            return x - padding <= other.x + other.w && x + w + padding >= other.x &&
-                    y - padding <= other.y + other.h && y + h + padding >= other.y
-        }
+    private class BspNode(
+        val x: Int,
+        val y: Int,
+        val w: Int,
+        val h: Int,
+        var left: BspNode? = null,
+        var right: BspNode? = null,
+        var room: Room? = null
+    ) {
+        val isLeaf: Boolean get() = left == null && right == null
+
+        fun anyRoom(): Room? = room ?: left?.anyRoom() ?: right?.anyRoom()
+    }
+
+    fun biomeForFloor(floorNumber: Int): TilesetBiome = when (floorNumber) {
+        1 -> TilesetBiome.FLESH
+        2 -> TilesetBiome.STEEL
+        else -> TilesetBiome.CRUCIBLE
     }
 
     fun generateFloor(floorNumber: Int, seed: Long = System.currentTimeMillis()): DungeonFloor {
         val random = Random(seed)
-        val width = 22
-        val height = 22
+        val width = 26
+        val height = 26
+        val biome = biomeForFloor(floorNumber)
 
         val sectorName = when (floorNumber) {
-            1 -> "Рівень 1: Затоплені Катакомби"
-            2 -> "Рівень 2: Шлакові Штольні Мануфактури"
-            3 -> "Рівень 3: Хтонічне Горнило Бога Фабрики"
-            else -> "Рівень $floorNumber: Безодня Нескінченності"
+            1 -> "Ярус 1: Некро-Катакомби Плоті"
+            2 -> "Ярус 2: Шлакова Мануфактура Сталі"
+            3 -> "Ярус 3: Хтонічне Горнило Безодні"
+            else -> "Ярус $floorNumber: Бездонний Реактор"
         }
 
-        // 1. Initialize world grid with solid walls
+        // 1. Initialize solid biomechanical shell walls
         val tiles = Array(width) { x ->
             Array(height) { y ->
-                val isIron = (floorNumber >= 2 && random.nextFloat() < 0.25f)
+                val defaultWall = when (biome) {
+                    TilesetBiome.FLESH -> if (random.nextFloat() < 0.22f) TileType.IRON_WALL else TileType.WALL
+                    TilesetBiome.STEEL -> if (random.nextFloat() < 0.78f) TileType.IRON_WALL else TileType.WALL
+                    TilesetBiome.CRUCIBLE -> if (random.nextFloat() < 0.55f) TileType.IRON_WALL else TileType.WALL
+                }
                 Tile(
                     pos = GridPos(x, y),
-                    type = if (isIron) TileType.IRON_WALL else TileType.WALL
+                    type = defaultWall,
+                    biome = biome
                 )
             }
         }
 
-        // 2. Generate thematic rooms with distinct 16-bit architectural layouts
+        // 2. Partition floor space with Binary Space Partitioning (BSP)
+        val root = BspNode(1, 1, width - 2, height - 2)
+        splitBsp(root, depth = 0, maxDepth = 3, minLeafSize = 7, random = random)
+
+        // 3. Carve rooms inside BSP leaves and stamp biomechanical architectural templates
         val rooms = mutableListOf<Room>()
-        val targetRooms = 5 + random.nextInt(3)
-        var attempts = 0
+        populateBspRooms(root, tiles, biome, rooms, random)
 
-        while (rooms.size < targetRooms && attempts < 120) {
-            attempts++
-            val rw = 4 + random.nextInt(4)
-            val rh = 4 + random.nextInt(4)
-            val rx = 1 + random.nextInt(width - rw - 2)
-            val ry = 1 + random.nextInt(height - rh - 2)
-
-            val roomType = when {
-                floorNumber == 3 && rooms.isEmpty() -> RoomType.CRUCIBLE_ARENA
-                random.nextFloat() < 0.25f -> RoomType.PILLARED_SANCTUARY
-                random.nextFloat() < 0.45f -> RoomType.FLOODED_CISTERN
-                random.nextFloat() < 0.65f -> RoomType.SMELTER_TRENCH
-                else -> RoomType.STANDARD_CHAMBER
-            }
-
-            val candidate = Room(rx, ry, rw, rh, roomType)
-            if (rooms.none { it.intersects(candidate, padding = 1) }) {
-                rooms.add(candidate)
-                carveRoomLayout(tiles, candidate, floorNumber, random)
-            }
-        }
-
-        // Fallback guarantee: at least 3 rooms
+        // Guarantee minimum chambers if RNG split aggressively
         if (rooms.size < 2) {
-            val r1 = Room(2, 2, 6, 6, RoomType.STANDARD_CHAMBER)
-            val r2 = Room(12, 12, 7, 7, RoomType.CRUCIBLE_ARENA)
+            val r1 = Room(2, 2, 6, 6, isStart = true)
+            val r2 = Room(width - 9, height - 9, 7, 7)
             rooms.add(r1)
             rooms.add(r2)
-            carveRoomLayout(tiles, r1, floorNumber, random)
-            carveRoomLayout(tiles, r2, floorNumber, random)
+            carveRoomWithStamp(tiles, r1, biome, applyStamp = false, random = random)
+            carveRoomWithStamp(tiles, r2, biome, applyStamp = true, random = random)
         }
 
-        // 3. Connect rooms with corridors with 16-bit archways and natural turns
-        for (i in 0 until rooms.size - 1) {
-            val r1 = rooms[i]
-            val r2 = rooms[i + 1]
+        // 4. Connect BSP siblings recursively via biomechanical conduit corridors
+        connectBspSubtrees(root, tiles, biome, random)
 
-            var cx = r1.centerX
-            var cy = r1.centerY
-            val tx = r2.centerX
-            val ty = r2.centerY
-
-            // Carve L-shaped corridor with occasional 2-wide sections
-            while (cx != tx) {
-                carveCorridorTile(tiles, cx, cy, floorNumber, random)
-                cx += if (tx > cx) 1 else -1
-            }
-            while (cy != ty) {
-                carveCorridorTile(tiles, cx, cy, floorNumber, random)
-                cy += if (ty > cy) 1 else -1
+        // Add 1-2 extra flanking loop corridors between nearest rooms for tactical depth
+        if (rooms.size >= 4) {
+            val extraConnections = minOf(2, rooms.size / 2)
+            for (c in 0 until extraConnections) {
+                val rA = rooms[c]
+                val rB = rooms[(c + 2) % rooms.size]
+                carveBiomechanicalCorridor(tiles, rA.centerX, rA.centerY, rB.centerX, rB.centerY, biome, random)
             }
         }
 
-        // 4. Ensure path connectivity via BFS flood-fill
+        // Pick farthest room pair (start = first, exit = farthest from start)
         val startRoom = rooms.first()
-        val exitRoom = rooms.last()
         val playerStart = GridPos(startRoom.centerX, startRoom.centerY)
+        val exitRoom = rooms.maxByOrNull {
+            abs(it.centerX - playerStart.x) + abs(it.centerY - playerStart.y)
+        } ?: rooms.last()
         val exitPos = GridPos(exitRoom.centerX, exitRoom.centerY)
 
-        ensureConnectivity(tiles, playerStart, exitPos, floorNumber, random)
+        // 5. Verify full BFS connectivity from playerStart to all rooms and exit
+        for (room in rooms) {
+            ensureConnectivity(tiles, playerStart, GridPos(room.centerX, room.centerY), biome, random)
+        }
+        ensureConnectivity(tiles, playerStart, exitPos, biome, random)
 
-        // Set elevator exit tile
+        // Guarantee safe start & clear elevator exit
+        tiles[playerStart.x][playerStart.y].type = TileType.FLOOR
         tiles[exitPos.x][exitPos.y].type = TileType.ELEVATOR_EXIT
 
-        // 5. Compute 16-bit autotiling bitmasks & perspectives
-        compute16BitAutotiling(tiles, width, height, random)
+        // 6. Compute 4-bit cardinal autotiling masks, wall facades, and conduit links
+        compute16BitAutotiling(tiles, width, height, biome, random)
 
-        // 6. Place interactive shrines, altars, and relic chests in distinct rooms
-        if (rooms.size > 2) {
-            val altarRoom = rooms[1]
-            val altarPos = GridPos(altarRoom.centerX, altarRoom.centerY)
-            if (altarPos != playerStart && altarPos != exitPos) {
-                tiles[altarPos.x][altarPos.y].type = if (floorNumber % 2 == 1) {
-                    TileType.CHTHONIC_ALTAR
-                } else {
-                    TileType.SMELTER_FORGE
+        // 7. Place interactive altars, forges, and relic chests in chambers
+        val midRooms = rooms.filter { it != startRoom && it != exitRoom }
+        if (midRooms.isNotEmpty()) {
+            val altarRoom = midRooms[0]
+            val altarPos = findNearestWalkableCell(tiles, GridPos(altarRoom.centerX, altarRoom.centerY), playerStart, exitPos)
+            if (altarPos != null) {
+                tiles[altarPos.x][altarPos.y].type = when (biome) {
+                    TilesetBiome.FLESH -> TileType.CHTHONIC_ALTAR
+                    TilesetBiome.STEEL -> TileType.SMELTER_FORGE
+                    TilesetBiome.CRUCIBLE -> if (random.nextBoolean()) TileType.CHTHONIC_ALTAR else TileType.SMELTER_FORGE
                 }
             }
         }
-        if (rooms.size > 3) {
-            val chestRoom = rooms[2]
-            val chestPos = GridPos(chestRoom.x + 1, chestRoom.y + 1)
-            if (chestPos != playerStart && chestPos != exitPos && tiles[chestPos.x][chestPos.y].isWalkable) {
-                tiles[chestPos.x][chestPos.y].type = TileType.RELIC_CHEST
+        if (midRooms.size > 1) {
+            val chestRoom = midRooms[1]
+            val candidate = GridPos(chestRoom.x + 1, chestRoom.y + 1)
+            if (candidate != playerStart && candidate != exitPos && tiles[candidate.x][candidate.y].isWalkable) {
+                tiles[candidate.x][candidate.y].type = TileType.RELIC_CHEST
             }
         }
 
-        // 7. Spawn enemies in outer rooms
+        // Recompute wall masks in case altar/chest placement changed walkability
+        compute16BitAutotiling(tiles, width, height, biome, random)
+
+        // 8. Spawn biome-appropriate enemies in non-start rooms
         val enemies = mutableListOf<Enemy>()
         var enemyIdCounter = 1
 
-        for (i in 1 until rooms.size) {
-            val room = rooms[i]
-            val isFinalRoom = (i == rooms.size - 1)
-            val enemyCount = if (isFinalRoom && floorNumber == 3) 1 else 1 + random.nextInt(2)
+        for (room in rooms) {
+            if (room == startRoom) continue
+            val isExitChamber = (room == exitRoom)
+            val enemyCount = if (isExitChamber && floorNumber >= 3) 1 else 1 + random.nextInt(2)
 
             for (k in 0 until enemyCount) {
-                val ex = (room.x + 1 + random.nextInt(maxOf(1, room.w - 2))).coerceIn(1, width - 2)
-                val ey = (room.y + 1 + random.nextInt(maxOf(1, room.h - 2))).coerceIn(1, height - 2)
+                val ex = (room.x + random.nextInt(room.w)).coerceIn(1, width - 2)
+                val ey = (room.y + random.nextInt(room.h)).coerceIn(1, height - 2)
                 val pos = GridPos(ex, ey)
 
-                if (pos != playerStart && pos != exitPos && tiles[ex][ey].isWalkable) {
+                if (pos != playerStart && pos != exitPos &&
+                    tiles[ex][ey].isWalkable &&
+                    enemies.none { it.pos == pos }
+                ) {
                     val arch = when {
-                        floorNumber == 3 && isFinalRoom -> EnemyArchetype.CRUCIBLE_TITAN
-                        floorNumber == 1 -> if (random.nextBoolean()) EnemyArchetype.CRAWLING_SPIDER else EnemyArchetype.CHTHONIC_CULTIST
-                        floorNumber == 2 -> if (random.nextBoolean()) EnemyArchetype.SLAG_HOUND else EnemyArchetype.IRON_AUTOMATON
-                        else -> EnemyArchetype.values().filter { it != EnemyArchetype.CRUCIBLE_TITAN }.random(random)
+                        floorNumber >= 3 && isExitChamber -> EnemyArchetype.CRUCIBLE_TITAN
+                        biome == TilesetBiome.FLESH -> if (random.nextBoolean()) EnemyArchetype.CRAWLING_SPIDER else EnemyArchetype.CHTHONIC_CULTIST
+                        biome == TilesetBiome.STEEL -> if (random.nextBoolean()) EnemyArchetype.IRON_AUTOMATON else EnemyArchetype.SLAG_HOUND
+                        else -> EnemyArchetype.entries.filter { it != EnemyArchetype.CRUCIBLE_TITAN }.random(random)
                     }
 
                     enemies.add(
@@ -194,7 +197,45 @@ object DungeonGenerator {
             }
         }
 
-        // Dilemma trigger
+        // 9. Spawn tactical interactive obstacles (explosive barrels, crates, traps)
+        val props = mutableListOf<TacticalProp>()
+        var propIdCounter = 1
+
+        for (room in rooms) {
+            val propCount = 1 + random.nextInt(2)
+            for (p in 0 until propCount) {
+                val px = (room.x + random.nextInt(room.w)).coerceIn(1, width - 2)
+                val py = (room.y + random.nextInt(room.h)).coerceIn(1, height - 2)
+                val pPos = GridPos(px, py)
+
+                if (pPos != playerStart && pPos != exitPos &&
+                    tiles[px][py].isWalkable &&
+                    enemies.none { it.pos == pPos } &&
+                    props.none { it.pos == pPos }
+                ) {
+                    val pType = when (biome) {
+                        TilesetBiome.FLESH -> when {
+                            random.nextFloat() < 0.4f -> TacticalPropType.EXPLOSIVE_BARREL
+                            random.nextFloat() < 0.75f -> TacticalPropType.SPIKE_PLATE
+                            else -> TacticalPropType.BARRICADE_CRATE
+                        }
+                        TilesetBiome.STEEL -> when {
+                            random.nextFloat() < 0.45f -> TacticalPropType.EXPLOSIVE_BARREL
+                            random.nextFloat() < 0.78f -> TacticalPropType.STEAM_PRESSURE_VENT
+                            else -> TacticalPropType.BARRICADE_CRATE
+                        }
+                        TilesetBiome.CRUCIBLE -> when {
+                            random.nextFloat() < 0.55f -> TacticalPropType.EXPLOSIVE_BARREL
+                            random.nextFloat() < 0.85f -> TacticalPropType.STEAM_PRESSURE_VENT
+                            else -> TacticalPropType.SPIKE_PLATE
+                        }
+                    }
+                    props.add(TacticalProp("prop_${floorNumber}_$propIdCounter", pPos, pType))
+                    propIdCounter++
+                }
+            }
+        }
+
         val dilemma = when (floorNumber) {
             1 -> DilemmaCatalog.dilemmas[0]
             2 -> DilemmaCatalog.dilemmas[1]
@@ -205,94 +246,122 @@ object DungeonGenerator {
         return DungeonFloor(
             floorNumber = floorNumber,
             sectorName = sectorName,
+            biome = biome,
             width = width,
             height = height,
             tiles = tiles,
             enemies = enemies,
+            props = props,
             playerStart = playerStart,
             exitPos = exitPos,
             pendingDilemma = dilemma
         )
     }
 
-    private fun carveRoomLayout(
+    private fun splitBsp(
+        node: BspNode,
+        depth: Int,
+        maxDepth: Int,
+        minLeafSize: Int,
+        random: Random
+    ) {
+        if (depth >= maxDepth) return
+
+        val canSplitH = node.h >= minLeafSize * 2
+        val canSplitV = node.w >= minLeafSize * 2
+        if (!canSplitH && !canSplitV) return
+
+        val splitHorizontally = when {
+            canSplitH && !canSplitV -> true
+            canSplitV && !canSplitH -> false
+            node.w > node.h * 1.25f -> false
+            node.h > node.w * 1.25f -> true
+            else -> random.nextBoolean()
+        }
+
+        if (splitHorizontally) {
+            val splitAt = random.nextInt(minLeafSize, node.h - minLeafSize + 1)
+            node.left = BspNode(node.x, node.y, node.w, splitAt)
+            node.right = BspNode(node.x, node.y + splitAt, node.w, node.h - splitAt)
+        } else {
+            val splitAt = random.nextInt(minLeafSize, node.w - minLeafSize + 1)
+            node.left = BspNode(node.x, node.y, splitAt, node.h)
+            node.right = BspNode(node.x + splitAt, node.y, node.w - splitAt, node.h)
+        }
+
+        node.left?.let { splitBsp(it, depth + 1, maxDepth, minLeafSize, random) }
+        node.right?.let { splitBsp(it, depth + 1, maxDepth, minLeafSize, random) }
+    }
+
+    private fun populateBspRooms(
+        node: BspNode,
+        tiles: Array<Array<Tile>>,
+        biome: TilesetBiome,
+        outRooms: MutableList<Room>,
+        random: Random
+    ) {
+        if (node.isLeaf) {
+            val maxW = (node.w - 2).coerceAtLeast(5)
+            val maxH = (node.h - 2).coerceAtLeast(5)
+            val rw = if (maxW > 5) random.nextInt(5, maxW + 1) else maxW.coerceAtMost(node.w - 1)
+            val rh = if (maxH > 5) random.nextInt(5, maxH + 1) else maxH.coerceAtMost(node.h - 1)
+
+            val slackX = (node.w - rw - 1).coerceAtLeast(1)
+            val slackY = (node.h - rh - 1).coerceAtLeast(1)
+            val rx = node.x + random.nextInt(1, slackX + 1)
+            val ry = node.y + random.nextInt(1, slackY + 1)
+
+            val isFirst = outRooms.isEmpty()
+            val room = Room(rx, ry, rw, rh, isStart = isFirst)
+            node.room = room
+            outRooms.add(room)
+            carveRoomWithStamp(tiles, room, biome, applyStamp = !isFirst, random = random)
+        } else {
+            node.left?.let { populateBspRooms(it, tiles, biome, outRooms, random) }
+            node.right?.let { populateBspRooms(it, tiles, biome, outRooms, random) }
+        }
+    }
+
+    private fun carveRoomWithStamp(
         tiles: Array<Array<Tile>>,
         room: Room,
-        floorNumber: Int,
+        biome: TilesetBiome,
+        applyStamp: Boolean,
         random: Random
     ) {
         for (x in room.x until room.x + room.w) {
             for (y in room.y until room.y + room.h) {
-                tiles[x][y].type = TileType.FLOOR
-                tiles[x][y].floorVariation = random.nextInt(4)
-            }
-        }
-
-        when (room.type) {
-            RoomType.PILLARED_SANCTUARY -> {
-                // Symmetrical 16-bit pillars in corners
-                if (room.w >= 5 && room.h >= 5) {
-                    val p1X = room.x + 1
-                    val p1Y = room.y + 1
-                    val p2X = room.x + room.w - 2
-                    val p2Y = room.y + room.h - 2
-
-                    tiles[p1X][p1Y].type = TileType.IRON_WALL
-                    tiles[p1X][p1Y].isPillar = true
-
-                    tiles[p2X][p1Y].type = TileType.IRON_WALL
-                    tiles[p2X][p1Y].isPillar = true
-
-                    tiles[p1X][p2Y].type = TileType.IRON_WALL
-                    tiles[p1X][p2Y].isPillar = true
-
-                    tiles[p2X][p2Y].type = TileType.IRON_WALL
-                    tiles[p2X][p2Y].isPillar = true
-                }
-            }
-            RoomType.FLOODED_CISTERN -> {
-                // Central canal/pool with bridge
-                val poolType = if (floorNumber == 1) TileType.WATER_PUDDLE else TileType.TOXIC_MIRE
-                val midX = room.centerX
-                val midY = room.centerY
-                tiles[midX][midY].type = poolType
-                if (room.w > 4) {
-                    tiles[midX - 1][midY].type = poolType
-                    tiles[midX + 1][midY].type = poolType
-                }
-            }
-            RoomType.SMELTER_TRENCH -> {
-                // Molten slag trench
-                val poolType = if (random.nextBoolean()) TileType.EMBER_HEARTH else TileType.OIL_SLICK
-                val midY = room.centerY
-                for (x in room.x + 1 until room.x + room.w - 1) {
-                    if (random.nextFloat() < 0.7f) {
-                        tiles[x][midY].type = poolType
-                    }
-                }
-            }
-            RoomType.CRUCIBLE_ARENA -> {
-                // Central grate and surrounding embers
-                tiles[room.centerX][room.centerY].type = TileType.RUST_GRATE
-                if (room.w >= 6 && room.h >= 6) {
-                    tiles[room.centerX - 1][room.centerY].type = TileType.RUST_GRATE
-                    tiles[room.centerX + 1][room.centerY].type = TileType.RUST_GRATE
-                    tiles[room.centerX][room.centerY - 1].type = TileType.RUST_GRATE
-                    tiles[room.centerX][room.centerY + 1].type = TileType.RUST_GRATE
-                }
-            }
-            RoomType.STANDARD_CHAMBER -> {
-                // Subtle rust grates
-                if (random.nextFloat() < 0.4f) {
-                    tiles[room.centerX][room.centerY].type = TileType.RUST_GRATE
+                if (x in 1 until tiles.size - 1 && y in 1 until tiles[0].size - 1) {
+                    tiles[x][y].type = TileType.FLOOR
+                    tiles[x][y].biome = biome
+                    tiles[x][y].floorVariation = random.nextInt(4)
                 }
             }
         }
 
-        // Scatter ambient resources on floor
-        if (random.nextFloat() < 0.55f) {
-            val lx = room.x + random.nextInt(room.w)
-            val ly = room.y + random.nextInt(room.h)
+        if (applyStamp) {
+            val stamp = BiomechRoomStamps.pickStampFor(biome, room.w, room.h, random)
+            if (stamp != null) {
+                BiomechRoomStamps.applyStampToRoom(
+                    tiles = tiles,
+                    roomX = room.x,
+                    roomY = room.y,
+                    roomW = room.w,
+                    roomH = room.h,
+                    biome = biome,
+                    stamp = stamp,
+                    random = random
+                )
+            }
+        } else {
+            // Subtle biomechanical trim on start chamber
+            tiles[room.centerX][room.centerY].decal = BiomechDecal.RIVET_PLATE
+        }
+
+        // Ambient resource drop
+        if (random.nextFloat() < 0.6f) {
+            val lx = (room.x + random.nextInt(room.w)).coerceIn(1, tiles.size - 2)
+            val ly = (room.y + random.nextInt(room.h)).coerceIn(1, tiles[0].size - 2)
             if (tiles[lx][ly].isWalkable) {
                 tiles[lx][ly].scrapLoot = 3 + random.nextInt(7)
                 tiles[lx][ly].biomassLoot = 2 + random.nextInt(6)
@@ -300,26 +369,112 @@ object DungeonGenerator {
         }
     }
 
-    private fun carveCorridorTile(
+    private fun connectBspSubtrees(
+        node: BspNode,
+        tiles: Array<Array<Tile>>,
+        biome: TilesetBiome,
+        random: Random
+    ) {
+        val leftChild = node.left ?: return
+        val rightChild = node.right ?: return
+
+        connectBspSubtrees(leftChild, tiles, biome, random)
+        connectBspSubtrees(rightChild, tiles, biome, random)
+
+        val r1 = leftChild.anyRoom()
+        val r2 = rightChild.anyRoom()
+        if (r1 != null && r2 != null) {
+            carveBiomechanicalCorridor(tiles, r1.centerX, r1.centerY, r2.centerX, r2.centerY, biome, random)
+        }
+    }
+
+    private fun carveBiomechanicalCorridor(
+        tiles: Array<Array<Tile>>,
+        x1: Int,
+        y1: Int,
+        x2: Int,
+        y2: Int,
+        biome: TilesetBiome,
+        random: Random
+    ) {
+        var cx = x1
+        var cy = y1
+        val horizontalFirst = random.nextBoolean()
+        val carryConduit = random.nextFloat() < 0.72f
+
+        if (horizontalFirst) {
+            while (cx != x2) {
+                carveCorridorStep(tiles, cx, cy, biome, carryConduit, random)
+                cx += if (x2 > cx) 1 else -1
+            }
+            while (cy != y2) {
+                carveCorridorStep(tiles, cx, cy, biome, carryConduit, random)
+                cy += if (y2 > cy) 1 else -1
+            }
+        } else {
+            while (cy != y2) {
+                carveCorridorStep(tiles, cx, cy, biome, carryConduit, random)
+                cy += if (y2 > cy) 1 else -1
+            }
+            while (cx != x2) {
+                carveCorridorStep(tiles, cx, cy, biome, carryConduit, random)
+                cx += if (x2 > cx) 1 else -1
+            }
+        }
+        carveCorridorStep(tiles, x2, y2, biome, carryConduit, random)
+    }
+
+    private fun carveCorridorStep(
         tiles: Array<Array<Tile>>,
         x: Int,
         y: Int,
-        floorNumber: Int,
+        biome: TilesetBiome,
+        carryConduit: Boolean,
         random: Random
     ) {
         val w = tiles.size
         val h = tiles[0].size
-        if (x in 1 until w - 1 && y in 1 until h - 1) {
-            tiles[x][y].type = if (random.nextFloat() < 0.15f) TileType.RUST_GRATE else TileType.FLOOR
-            tiles[x][y].floorVariation = random.nextInt(4)
+        if (x !in 1 until w - 1 || y !in 1 until h - 1) return
+
+        val tile = tiles[x][y]
+        tile.biome = biome
+        if (!tile.isWalkable) {
+            tile.type = if (random.nextFloat() < 0.16f) TileType.RUST_GRATE else TileType.FLOOR
+            tile.floorVariation = random.nextInt(4)
         }
+        if (carryConduit && tile.decal == BiomechDecal.NONE) {
+            tile.decal = when (biome) {
+                TilesetBiome.FLESH -> BiomechDecal.FLESH_VEINS
+                TilesetBiome.STEEL -> BiomechDecal.COPPER_PIPE
+                TilesetBiome.CRUCIBLE -> BiomechDecal.RUNIC_SEAM
+            }
+        }
+    }
+
+    private fun findNearestWalkableCell(
+        tiles: Array<Array<Tile>>,
+        center: GridPos,
+        excludeA: GridPos,
+        excludeB: GridPos
+    ): GridPos? {
+        if (center != excludeA && center != excludeB && tiles[center.x][center.y].isWalkable) {
+            return center
+        }
+        for (n in center.adjacentNeighbors(includeDiagonals = true)) {
+            if (n.x in 1 until tiles.size - 1 && n.y in 1 until tiles[0].size - 1) {
+                if (n != excludeA && n != excludeB && tiles[n.x][n.y].isWalkable) {
+                    return n
+                }
+            }
+        }
+        return null
     }
 
     private fun ensureConnectivity(
         tiles: Array<Array<Tile>>,
         start: GridPos,
         target: GridPos,
-        floorNumber: Int,
+        biome: TilesetBiome,
         random: Random
     ) {
         val w = tiles.size
@@ -348,45 +503,83 @@ object DungeonGenerator {
         }
 
         if (!reached) {
-            // Tunnel direct connecting corridor
-            var cx = start.x
-            var cy = start.y
-            while (cx != target.x) {
-                tiles[cx][cy].type = TileType.FLOOR
-                cx += if (target.x > cx) 1 else -1
-            }
-            while (cy != target.y) {
-                tiles[cx][cy].type = TileType.FLOOR
-                cy += if (target.y > cy) 1 else -1
-            }
+            carveBiomechanicalCorridor(tiles, start.x, start.y, target.x, target.y, biome, random)
         }
     }
 
-    private fun compute16BitAutotiling(
+    private fun isStructuralWall(type: TileType): Boolean =
+        type == TileType.VOID || type == TileType.WALL || type == TileType.IRON_WALL
+
+    /**
+     * Computes 4-bit cardinal autotiling masks (N=1, E=2, S=4, W=8) for walls and floor conduits.
+     */
+    fun compute16BitAutotiling(
         tiles: Array<Array<Tile>>,
         width: Int,
         height: Int,
+        biome: TilesetBiome,
         random: Random
     ) {
         for (x in 0 until width) {
             for (y in 0 until height) {
                 val tile = tiles[x][y]
-                if (!tile.isWalkable) {
-                    // Check if South neighbor is walkable floor -> Wall Front Face!
-                    val southWalkable = (y + 1 < height) && tiles[x][y + 1].isWalkable
-                    tile.wallFrontFace = southWalkable
+                if (isStructuralWall(tile.type)) {
+                    val northWall = (y - 1 < 0) || isStructuralWall(tiles[x][y - 1].type)
+                    val eastWall = (x + 1 >= width) || isStructuralWall(tiles[x + 1][y].type)
+                    val southWall = (y + 1 >= height) || isStructuralWall(tiles[x][y + 1].type)
+                    val westWall = (x - 1 < 0) || isStructuralWall(tiles[x - 1][y].type)
 
-                    // Check top edge
-                    val northWalkable = (y - 1 >= 0) && tiles[x][y - 1].isWalkable
-                    tile.wallTopEdge = northWalkable
+                    var mask = 0
+                    if (northWall) mask = mask or 1
+                    if (eastWall) mask = mask or 2
+                    if (southWall) mask = mask or 4
+                    if (westWall) mask = mask or 8
 
-                    // Left & Right edges
-                    tile.wallLeftEdge = (x - 1 >= 0) && tiles[x - 1][y].isWalkable
-                    tile.wallRightEdge = (x + 1 < width) && tiles[x + 1][y].isWalkable
+                    tile.wallMask = mask
+                    tile.wallFrontFace = (mask and 4) == 0 && y + 1 < height
+                    tile.wallTopEdge = (mask and 1) == 0 && y - 1 >= 0
+                    tile.wallLeftEdge = (mask and 8) == 0 && x - 1 >= 0
+                    tile.wallRightEdge = (mask and 2) == 0 && x + 1 < width
+                    tile.isPillar = (mask == 0)
 
-                    // Wall torch placement: on front facades with 25% chance
-                    if (tile.wallFrontFace && x % 3 == 1 && random.nextFloat() < 0.45f) {
-                        tile.hasWallTorch = true
+                    // Wall facade decorations based on biome & spacing
+                    if (tile.wallFrontFace) {
+                        if (x % 3 == 1 && random.nextFloat() < 0.42f) {
+                            tile.hasWallTorch = true
+                        }
+                        tile.hasWallPipe = (biome == TilesetBiome.STEEL || biome == TilesetBiome.CRUCIBLE) &&
+                                !tile.hasWallTorch && ((x + y) % 2 == 0)
+                        tile.hasWallTendril = (biome == TilesetBiome.FLESH || biome == TilesetBiome.CRUCIBLE) &&
+                                !tile.hasWallTorch && (random.nextFloat() < 0.35f)
+                    } else {
+                        tile.hasWallTorch = false
+                        tile.hasWallPipe = false
+                        tile.hasWallTendril = false
+                    }
+                } else {
+                    tile.wallMask = 0
+                    tile.wallFrontFace = false
+                    tile.wallTopEdge = false
+                    tile.wallLeftEdge = false
+                    tile.wallRightEdge = false
+                    tile.isPillar = false
+                    tile.hasWallTorch = false
+                    tile.hasWallPipe = false
+                    tile.hasWallTendril = false
+
+                    // 4-bit conduit connection mask for pipes / blood veins / runic seams
+                    if (tile.decal == BiomechDecal.FLESH_VEINS ||
+                        tile.decal == BiomechDecal.COPPER_PIPE ||
+                        tile.decal == BiomechDecal.RUNIC_SEAM
+                    ) {
+                        var cMask = 0
+                        if (y - 1 >= 0 && tiles[x][y - 1].decal == tile.decal) cMask = cMask or 1
+                        if (x + 1 < width && tiles[x + 1][y].decal == tile.decal) cMask = cMask or 2
+                        if (y + 1 < height && tiles[x][y + 1].decal == tile.decal) cMask = cMask or 4
+                        if (x - 1 >= 0 && tiles[x - 1][y].decal == tile.decal) cMask = cMask or 8
+                        tile.conduitMask = cMask
+                    } else {
+                        tile.conduitMask = 0
                     }
                 }
             }
@@ -401,7 +594,6 @@ object DungeonGenerator {
         val w = tiles.size
         val h = tiles[0].size
 
-        // Bounded clear around player instead of entire map
         val minX = (center.x - radius - 2).coerceAtLeast(0)
         val maxX = (center.x + radius + 2).coerceAtMost(w - 1)
         val minY = (center.y - radius - 2).coerceAtLeast(0)
@@ -413,7 +605,6 @@ object DungeonGenerator {
             }
         }
 
-        // Raycasting using precomputed trig deltas
         for (i in 0 until FOV_RAYS_COUNT) {
             val dx = fovDx[i]
             val dy = fovDy[i]

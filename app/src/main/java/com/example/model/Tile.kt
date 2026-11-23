@@ -17,7 +17,14 @@ data class Tile(
     var wallRightEdge: Boolean = false, // Has floor to the east
     var hasWallTorch: Boolean = false,  // Decorative wall sconce with flame
     var floorVariation: Int = 0,        // 0: smooth, 1: cracked, 2: runic, 3: metal trim
-    var isPillar: Boolean = false       // Isolated column/pillar
+    var isPillar: Boolean = false,      // Isolated column/pillar (wallMask == 0)
+    // Biomechanical tileset autotiling data
+    var biome: TilesetBiome = TilesetBiome.FLESH,
+    var wallMask: Int = 0,              // 4-bit cardinal mask (N=1, E=2, S=4, W=8) for adjacent walls
+    var conduitMask: Int = 0,           // 4-bit cardinal mask (N=1, E=2, S=4, W=8) for connected pipes/veins
+    var decal: BiomechDecal = BiomechDecal.NONE,
+    var hasWallPipe: Boolean = false,
+    var hasWallTendril: Boolean = false
 ) {
     val isWalkable: Boolean
         get() = type.isWalkable

@@ -76,12 +76,18 @@ data class Player(
     var maxAp: Int = 3,
     var fovRadius: Int = 6,
     var torchTurns: Int = 60,
+    // Immutable baselines for deterministic stat recalculation on organ upgrades/swaps
+    val baseMaxHp: Int = maxHp,
+    val baseArmor: Int = armor,
+    val baseMaxAp: Int = maxAp,
+    val baseFovRadius: Int = fovRadius,
     // Resources
     var scrap: Int = 15,
     var biomass: Int = 10,
     var essence: Int = 0,
-    // Equipment & Mutations
+    // Equipment, Bio-Bank & Mutations
     val activeMutations: MutableList<Mutation> = mutableListOf(),
+    val harvestedOrgans: MutableList<HarvestedOrgan> = mutableListOf(),
     val knownSkills: MutableList<CombatSkill> = mutableListOf(),
     val statuses: MutableList<StatusEffect> = mutableListOf(),
     var comboStage: ComboStage = ComboStage.READY,
@@ -93,14 +99,14 @@ data class Player(
     fun hasStatus(type: StatusEffectType): Boolean = statuses.any { it.type == type }
 
     fun totalAttackPower(): Int {
-        var bonus = activeMutations.sumOf { it.bonusAttackPower }
+        var bonus = activeMutations.sumOf { it.effectiveAttackPower() }
         if (hasStatus(StatusEffectType.ADRENALINE)) bonus += 5
         if (sanity < 30) bonus += 4 // Frenzy of despair
         return 10 + bonus
     }
 
     fun totalArmor(): Int {
-        var base = armor + activeMutations.sumOf { it.bonusArmor }
+        var base = armor + activeMutations.sumOf { it.effectiveArmor() }
         if (hasStatus(StatusEffectType.IRON_SKIN)) base += 4
         return base
     }
