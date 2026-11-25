@@ -5,6 +5,7 @@ import android.graphics.Typeface
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CutCornerShape
@@ -45,6 +46,8 @@ fun DungeonCanvas(
     enemies: List<Enemy>,
     props: List<TacticalProp> = emptyList(),
     validTargetCells: Set<GridPos> = emptySet(),
+    tacticalGrid: TacticalGridState = TacticalGridState(),
+    routePreview: RoutePreviewState = RoutePreviewState(),
     selectedSkill: CombatSkill? = null,
     targetEnemyId: String?,
     floatingFxList: List<FloatingFx>,
@@ -54,6 +57,7 @@ fun DungeonCanvas(
     activeEnemyAnims: List<EnemyAnimFx> = emptyList(),
     activeBanner: MilestoneBanner?,
     onTileTap: (GridPos) -> Unit,
+    onClearRoutePreview: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     if (tiles == null) return
@@ -77,18 +81,34 @@ fun DungeonCanvas(
     val currentOnTileTap by rememberUpdatedState(onTileTap)
     val currentPlayerPos by rememberUpdatedState(player.pos)
 
-    // Animation frame ticker ONLY when floating numbers or active FX are on screen
+    // Animation frame ticker when FX or interactive tactical route/AoE previews are active
     var animFrame by remember { mutableLongStateOf(0L) }
-    val hasActiveFx = floatingFxList.isNotEmpty() ||
+    val hasCombatFx = floatingFxList.isNotEmpty() ||
             activeAttackFx.isNotEmpty() ||
             activeExplosions.isNotEmpty() ||
             activeMutationSurges.isNotEmpty() ||
             activeEnemyAnims.isNotEmpty()
+    val attackTargetsSet = if (tacticalGrid.attackCells.isNotEmpty() || validTargetCells.isEmpty()) {
+        tacticalGrid.attackCells
+    } else {
+        validTargetCells
+    }
+    val hasTargetableEnemyInRange = enemies.any { enemy ->
+        !enemy.isDead &&
+            attackTargetsSet.contains(enemy.pos) &&
+            enemy.pos.x in 0 until gridW &&
+            enemy.pos.y in 0 until gridH &&
+            tiles[enemy.pos.x][enemy.pos.y].isVisible
+    }
+    val hasTacticalPulse = routePreview.targetPos != null ||
+            tacticalGrid.aoePreviewCells.isNotEmpty() ||
+            hasTargetableEnemyInRange
 
-    LaunchedEffect(hasActiveFx) {
-        if (hasActiveFx) {
+    LaunchedEffect(hasCombatFx, hasTacticalPulse) {
+        if (hasCombatFx || hasTacticalPulse) {
+            val frameStepMs = if (hasCombatFx) 16L else 45L
             while (true) {
-                delay(16)
+                delay(frameStepMs)
                 animFrame = System.currentTimeMillis()
             }
         }
@@ -216,77 +236,228 @@ fun DungeonCanvas(
                 }
             }
 
-            // 1.5 Draw Tactical Grid Overlay (Movement & Attack Distance Ranges)
-            if (player.currentAp > 0) {
-                // Tactical Movement Cells (adjacent walkable cells)
-                for (dx in -1..1) {
-                    for (dy in -1..1) {
-                        if (dx == 0 && dy == 0) continue
-                        val mx = player.pos.x + dx
-                        val my = player.pos.y + dy
-                        if (mx in minCol..maxCol && my in minRow..maxRow) {
-                            val mTile = tiles[mx][my]
-                            val isBlocked = props.any { !it.isDead && it.pos.x == mx && it.pos.y == my && it.type.blocksMovement }
-                            if (mTile.isWalkable && !isBlocked && mTile.isVisible) {
-                                val mDrawX = camOffsetX + mx * tileSize
-                                val mDrawY = camOffsetY + my * tileSize
-                                drawRect(
-                                    color = SanityCyan.copy(alpha = 0.08f),
-                                    topLeft = Offset(mDrawX, mDrawY),
-                                    size = Size(tileSize, tileSize)
-                                )
-                                drawTacticalCellCorners(mDrawX, mDrawY, tileSize, SanityCyan.copy(alpha = 0.35f * pulseAlpha))
-                            }
-                        }
+            // 1.5 Draw Multi-Layer Turn-Based Tactical Grid Overlay
+            // 1.5a Enemy Threat Overlay (attack reach of visible active enemies)
+            for (threatPos in tacticalGrid.enemyThreatCells) {
+                if (threatPos.x in minCol..maxCol && threatPos.y in minRow..maxRow) {
+                    val tTile = tiles[threatPos.x][threatPos.y]
+                    if (tTile.isVisible) {
+                        val tDrawX = camOffsetX + threatPos.x * tileSize
+                        val tDrawY = camOffsetY + threatPos.y * tileSize
+                        drawRect(
+                            color = BloodCrimson.copy(alpha = 0.08f),
+                            topLeft = Offset(tDrawX, tDrawY),
+                            size = Size(tileSize, tileSize)
+                        )
+                        drawLine(
+                            color = BloodCrimson.copy(alpha = 0.42f),
+                            start = Offset(tDrawX + 3f, tDrawY + tileSize - 3f),
+                            end = Offset(tDrawX + tileSize - 3f, tDrawY + 3f),
+                            strokeWidth = 1.2f
+                        )
                     }
                 }
+            }
 
-                // Tactical Attack Target Cells (calculated by CombatEngine)
-                for (targetPos in validTargetCells) {
-                    if (targetPos.x in minCol..maxCol && targetPos.y in minRow..maxRow) {
-                        val tTile = tiles[targetPos.x][targetPos.y]
-                        if (tTile.isVisible) {
-                            val tDrawX = camOffsetX + targetPos.x * tileSize
-                            val tDrawY = camOffsetY + targetPos.y * tileSize
-
-                            // Translucent range wash
-                            val isAoE = selectedSkill?.isAreaEffect == true
-                            val rangeColor = if (isAoE) EldritchViolet else ForgeAmber
-
-                            drawRect(
-                                color = rangeColor.copy(alpha = 0.16f),
-                                topLeft = Offset(tDrawX, tDrawY),
-                                size = Size(tileSize, tileSize)
+            // 1.5b Characteristic-Driven Reachable Movement Cells (BFS by AP, stride, hazards)
+            for ((movePos, apCost) in tacticalGrid.moveCosts) {
+                if (movePos.x in minCol..maxCol && movePos.y in minRow..maxRow) {
+                    val mTile = tiles[movePos.x][movePos.y]
+                    if (mTile.isVisible) {
+                        val mDrawX = camOffsetX + movePos.x * tileSize
+                        val mDrawY = camOffsetY + movePos.y * tileSize
+                        val isFreeStride = apCost == 0
+                        val isHazard = tacticalGrid.hazardMoveCells.contains(movePos)
+                        val moveColor = when {
+                            isHazard -> ForgeAmber
+                            isFreeStride -> ToxicGreen
+                            else -> SanityCyan
+                        }
+                        val fillAlpha = when {
+                            isFreeStride -> 0.13f
+                            isHazard -> 0.11f
+                            else -> 0.07f
+                        }
+                        drawRect(
+                            color = moveColor.copy(alpha = fillAlpha),
+                            topLeft = Offset(mDrawX, mDrawY),
+                            size = Size(tileSize, tileSize)
+                        )
+                        drawTacticalCellCorners(
+                            mDrawX,
+                            mDrawY,
+                            tileSize,
+                            moveColor.copy(alpha = (if (isFreeStride) 0.65f else 0.38f) * pulseAlpha)
+                        )
+                        if (isHazard) {
+                            drawCircle(
+                                color = ForgeAmber.copy(alpha = 0.75f),
+                                radius = tileSize * 0.08f,
+                                center = Offset(mDrawX + tileSize * 0.8f, mDrawY + tileSize * 0.2f)
                             )
-                            drawTacticalCellCorners(tDrawX, tDrawY, tileSize, rangeColor.copy(alpha = 0.65f * pulseAlpha))
-
-                            // If cell has enemy or barrel, draw tactical target lock reticle
-                            val hasEnemy = enemies.any { !it.isDead && it.pos == targetPos }
-                            val targetProp = props.find { !it.isDead && it.pos == targetPos }
-                            if (hasEnemy || (targetProp != null && targetProp.type.isExplosive)) {
-                                val reticleColor = if (hasEnemy) BloodCrimson else ForgeAmber
-                                drawCircle(
-                                    color = reticleColor.copy(alpha = pulseAlpha),
-                                    radius = tileSize * 0.42f,
-                                    center = Offset(tDrawX + tileSize / 2f, tDrawY + tileSize / 2f),
-                                    style = Stroke(width = 2f)
-                                )
-                                drawLine(
-                                    color = reticleColor.copy(alpha = pulseAlpha),
-                                    start = Offset(tDrawX + tileSize * 0.15f, tDrawY + tileSize / 2f),
-                                    end = Offset(tDrawX + tileSize * 0.85f, tDrawY + tileSize / 2f),
-                                    strokeWidth = 1.5f
-                                )
-                                drawLine(
-                                    color = reticleColor.copy(alpha = pulseAlpha),
-                                    start = Offset(tDrawX + tileSize / 2f, tDrawY + tileSize * 0.15f),
-                                    end = Offset(tDrawX + tileSize / 2f, tDrawY + tileSize * 0.85f),
-                                    strokeWidth = 1.5f
-                                )
-                            }
                         }
                     }
                 }
+            }
+
+            // 1.5c Tactical Attack Target Cells (scaled by FOV/sensor traits & AP affordability)
+            val attackTargets = if (tacticalGrid.attackCells.isNotEmpty() || validTargetCells.isEmpty()) {
+                tacticalGrid.attackCells
+            } else {
+                validTargetCells
+            }
+            for (targetPos in attackTargets) {
+                if (targetPos.x in minCol..maxCol && targetPos.y in minRow..maxRow) {
+                    val tTile = tiles[targetPos.x][targetPos.y]
+                    if (tTile.isVisible) {
+                        val tDrawX = camOffsetX + targetPos.x * tileSize
+                        val tDrawY = camOffsetY + targetPos.y * tileSize
+
+                        val isAoE = selectedSkill?.isAreaEffect == true
+                        val canAfford = tacticalGrid.canAffordSkill
+                        val rangeColor = when {
+                            !canAfford -> AshGrey
+                            isAoE -> EldritchViolet
+                            else -> ForgeAmber
+                        }
+
+                        drawRect(
+                            color = rangeColor.copy(alpha = if (canAfford) 0.14f else 0.06f),
+                            topLeft = Offset(tDrawX, tDrawY),
+                            size = Size(tileSize, tileSize)
+                        )
+                        drawTacticalCellCorners(
+                            tDrawX,
+                            tDrawY,
+                            tileSize,
+                            rangeColor.copy(alpha = (if (canAfford) 0.65f else 0.25f) * pulseAlpha)
+                        )
+
+                        // Target lock reticle on enemies & explosive props in range
+                        val hasEnemy = enemies.any { !it.isDead && it.pos == targetPos }
+                        val targetProp = props.find { !it.isDead && it.pos == targetPos }
+                        if (hasEnemy || (targetProp != null && targetProp.type.isExplosive)) {
+                            val reticleColor = when {
+                                !canAfford -> AshGrey
+                                hasEnemy -> BloodCrimson
+                                else -> ForgeAmber
+                            }
+                            drawCircle(
+                                color = reticleColor.copy(alpha = pulseAlpha),
+                                radius = tileSize * 0.42f,
+                                center = Offset(tDrawX + tileSize / 2f, tDrawY + tileSize / 2f),
+                                style = Stroke(width = 2f)
+                            )
+                            drawLine(
+                                color = reticleColor.copy(alpha = pulseAlpha),
+                                start = Offset(tDrawX + tileSize * 0.15f, tDrawY + tileSize / 2f),
+                                end = Offset(tDrawX + tileSize * 0.85f, tDrawY + tileSize / 2f),
+                                strokeWidth = 1.5f
+                            )
+                            drawLine(
+                                color = reticleColor.copy(alpha = pulseAlpha),
+                                start = Offset(tDrawX + tileSize / 2f, tDrawY + tileSize * 0.15f),
+                                end = Offset(tDrawX + tileSize / 2f, tDrawY + tileSize * 0.85f),
+                                strokeWidth = 1.5f
+                            )
+                        }
+                    }
+                }
+            }
+
+            // 1.5d AoE / Explosive Barrel Blast Zone Preview
+            for (aoePos in tacticalGrid.aoePreviewCells) {
+                if (aoePos.x in minCol..maxCol && aoePos.y in minRow..maxRow) {
+                    val aTile = tiles[aoePos.x][aoePos.y]
+                    if (aTile.isVisible) {
+                        val aDrawX = camOffsetX + aoePos.x * tileSize
+                        val aDrawY = camOffsetY + aoePos.y * tileSize
+                        drawRect(
+                            color = BloodCrimson.copy(alpha = 0.22f * pulseAlpha),
+                            topLeft = Offset(aDrawX + 2f, aDrawY + 2f),
+                            size = Size(tileSize - 4f, tileSize - 4f)
+                        )
+                        drawRect(
+                            color = EldritchViolet.copy(alpha = 0.8f * pulseAlpha),
+                            topLeft = Offset(aDrawX + 2f, aDrawY + 2f),
+                            size = Size(tileSize - 4f, tileSize - 4f),
+                            style = Stroke(width = 1.8f)
+                        )
+                    }
+                }
+            }
+
+            // 1.5e Two-Tap Route Preview Polyline & AP Cost Badge
+            if (routePreview.targetPos != null && routePreview.path.isNotEmpty()) {
+                val routeColor = when {
+                    routePreview.endsInThreatZone -> BloodCrimson
+                    routePreview.crossesHazard -> ForgeAmber
+                    routePreview.apCost == 0 -> ToxicGreen
+                    else -> SanityCyan
+                }
+
+                var prevCenter = Offset(
+                    camOffsetX + player.pos.x * tileSize + tileSize / 2f,
+                    camOffsetY + player.pos.y * tileSize + tileSize / 2f
+                )
+                for ((idx, stepPos) in routePreview.path.withIndex()) {
+                    val stepCenter = Offset(
+                        camOffsetX + stepPos.x * tileSize + tileSize / 2f,
+                        camOffsetY + stepPos.y * tileSize + tileSize / 2f
+                    )
+                    drawLine(
+                        color = routeColor.copy(alpha = 0.9f),
+                        start = prevCenter,
+                        end = stepCenter,
+                        strokeWidth = 3f
+                    )
+                    if (idx < routePreview.path.lastIndex) {
+                        val nodeSize = tileSize * 0.16f
+                        drawRect(
+                            color = routeColor,
+                            topLeft = Offset(stepCenter.x - nodeSize / 2f, stepCenter.y - nodeSize / 2f),
+                            size = Size(nodeSize, nodeSize)
+                        )
+                    }
+                    prevCenter = stepCenter
+                }
+
+                val dest = routePreview.targetPos
+                val destDrawX = camOffsetX + dest.x * tileSize
+                val destDrawY = camOffsetY + dest.y * tileSize
+                drawRect(
+                    color = routeColor.copy(alpha = 0.28f * pulseAlpha),
+                    topLeft = Offset(destDrawX + 1.5f, destDrawY + 1.5f),
+                    size = Size(tileSize - 3f, tileSize - 3f)
+                )
+                drawRect(
+                    color = routeColor,
+                    topLeft = Offset(destDrawX + 1.5f, destDrawY + 1.5f),
+                    size = Size(tileSize - 3f, tileSize - 3f),
+                    style = Stroke(width = 2.5f)
+                )
+
+                val costBadge = if (routePreview.crossesHazard || routePreview.endsInThreatZone) {
+                    "${routePreview.apCost}⚡!"
+                } else {
+                    "${routePreview.apCost}⚡"
+                }
+                textPaint.textSize = (tileSize * 0.28f).coerceAtLeast(12f)
+                textPaint.isFakeBoldText = true
+                val badgeCenterX = destDrawX + tileSize * 0.5f
+                val badgeBaselineY = destDrawY + tileSize * 0.34f
+                drawRect(
+                    color = VoidBlack.copy(alpha = 0.85f),
+                    topLeft = Offset(destDrawX + tileSize * 0.16f, destDrawY + tileSize * 0.08f),
+                    size = Size(tileSize * 0.68f, tileSize * 0.34f)
+                )
+                textPaint.color = routeColor.toArgb()
+                drawContext.canvas.nativeCanvas.drawText(
+                    costBadge,
+                    badgeCenterX,
+                    badgeBaselineY,
+                    textPaint
+                )
             }
 
             // 1.8 Draw Tactical Props & Obstacles (Barrels, Crates, Traps)
@@ -312,6 +483,7 @@ fun DungeonCanvas(
                 val drawX = camOffsetX + enemy.pos.x * tileSize
                 val drawY = camOffsetY + enemy.pos.y * tileSize
                 val isSelected = enemy.id == targetEnemyId
+                val isInAttackRange = attackTargets.contains(enemy.pos)
                 val enemyAnim = activeEnemyAnims.lastOrNull { it.enemyId == enemy.id }
 
                 draw16BitEnemy(
@@ -320,6 +492,9 @@ fun DungeonCanvas(
                     y = drawY,
                     tileSize = tileSize,
                     isSelected = isSelected,
+                    isInAttackRange = isInAttackRange,
+                    canAffordAttack = tacticalGrid.canAffordSkill,
+                    isAoeSkill = selectedSkill?.isAreaEffect == true,
                     pulseAlpha = pulseAlpha,
                     playerPos = player.pos,
                     enemyAnim = enemyAnim,
@@ -420,6 +595,46 @@ fun DungeonCanvas(
                         letterSpacing = 0.5.sp
                     )
                 }
+            }
+        }
+
+        // 6. Two-Tap Route Preview Confirmation Chip
+        if (routePreview.targetPos != null && routePreview.path.isNotEmpty()) {
+            val chipColor = when {
+                routePreview.endsInThreatZone -> BloodCrimson
+                routePreview.crossesHazard -> ForgeAmber
+                else -> SanityCyan
+            }
+            val warnText = when {
+                routePreview.endsInThreatZone -> " • ⚠️ ЗАГРОЗА"
+                routePreview.crossesHazard -> " • ⚠️ ПАСТКА"
+                else -> ""
+            }
+            Row(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 8.dp, start = 8.dp, end = 8.dp)
+                    .testTag("route_preview_chip")
+                    .clip(CutCornerShape(4.dp))
+                    .background(VoidBlack.copy(alpha = 0.92f))
+                    .border(1.5.dp, chipColor, CutCornerShape(4.dp))
+                    .clickable { onClearRoutePreview() }
+                    .padding(horizontal = 10.dp, vertical = 5.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Text(
+                    text = "МАРШРУТ: ${routePreview.path.size} КР. • ${routePreview.apCost} ОД$warnText (ЩЕ РАЗ — РУХ)",
+                    color = chipColor,
+                    fontSize = 10.sp,
+                    fontFamily = FontFamily.Monospace
+                )
+                Text(
+                    text = "✕",
+                    color = BoneIvory,
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace
+                )
             }
         }
     }
@@ -1048,6 +1263,9 @@ private fun DrawScope.draw16BitEnemy(
     y: Float,
     tileSize: Float,
     isSelected: Boolean,
+    isInAttackRange: Boolean,
+    canAffordAttack: Boolean,
+    isAoeSkill: Boolean,
     pulseAlpha: Float,
     playerPos: GridPos,
     enemyAnim: EnemyAnimFx?,
@@ -1057,10 +1275,38 @@ private fun DrawScope.draw16BitEnemy(
     val baseCenterX = x + tileSize / 2f
     val baseCenterY = y + tileSize / 2f
 
+    // Rhythmic targetability pulse wave when enemy lies inside selected skill attack range
+    val targetPulseWave = if (isInAttackRange) {
+        val phase = ((now % 850L) / 850.0) * (2.0 * Math.PI)
+        0.5f + 0.5f * sin(phase).toFloat()
+    } else {
+        0f
+    }
+
+    if (isInAttackRange) {
+        val auraColor = when {
+            !canAffordAttack -> AshGrey
+            isAoeSkill -> EldritchViolet
+            else -> BloodCrimson
+        }
+        val baseRadius = tileSize * (0.40f + 0.11f * targetPulseWave)
+        drawCircle(
+            color = auraColor.copy(alpha = (if (canAffordAttack) 0.24f else 0.10f) * (0.65f + 0.35f * targetPulseWave)),
+            radius = baseRadius,
+            center = Offset(baseCenterX, baseCenterY)
+        )
+        drawCircle(
+            color = auraColor.copy(alpha = (if (canAffordAttack) 0.88f else 0.35f) * (0.55f + 0.45f * targetPulseWave)),
+            radius = baseRadius,
+            center = Offset(baseCenterX, baseCenterY),
+            style = Stroke(width = if (canAffordAttack) 2.4f else 1.5f)
+        )
+    }
+
     if (isSelected) {
         drawCircle(
             color = ForgeAmber.copy(alpha = pulseAlpha),
-            radius = tileSize * 0.48f,
+            radius = tileSize * 0.50f,
             center = Offset(baseCenterX, baseCenterY),
             style = Stroke(width = 2.5f)
         )
@@ -1102,12 +1348,17 @@ private fun DrawScope.draw16BitEnemy(
 
     val centerX = baseCenterX + offsetX
     val centerY = baseCenterY + offsetY
+    val pulseScale = if (isInAttackRange) {
+        if (canAffordAttack) 1.0f + 0.085f * targetPulseWave else 1.0f + 0.025f * targetPulseWave
+    } else {
+        1.0f
+    }
 
     // Contact ground shadow under monster
     drawOval(
         color = Color.Black.copy(alpha = 0.45f),
-        topLeft = Offset(centerX - tileSize * 0.34f, baseCenterY + tileSize * 0.24f),
-        size = Size(tileSize * 0.68f, tileSize * 0.2f)
+        topLeft = Offset(centerX - tileSize * 0.34f * pulseScale, baseCenterY + tileSize * 0.24f),
+        size = Size(tileSize * 0.68f * pulseScale, tileSize * 0.2f)
     )
 
     if (spriteFrames != null) {
@@ -1116,8 +1367,8 @@ private fun DrawScope.draw16BitEnemy(
             EnemyAnimPhase.ATTACK -> spriteFrames.attack
             EnemyAnimPhase.HURT -> spriteFrames.hurt
         }
-        val spriteScale = if (enemy.archetype == EnemyArchetype.CRUCIBLE_TITAN) 1.24f else 1.04f
-        val drawDim = (tileSize * spriteScale).roundToInt().coerceAtLeast(1)
+        val baseSpriteScale = if (enemy.archetype == EnemyArchetype.CRUCIBLE_TITAN) 1.24f else 1.04f
+        val drawDim = (tileSize * baseSpriteScale * pulseScale).roundToInt().coerceAtLeast(1)
         val drawLeft = (centerX - drawDim / 2f).roundToInt()
         val drawTop = (centerY - drawDim / 2f - tileSize * 0.06f).roundToInt()
 
@@ -1150,30 +1401,40 @@ private fun DrawScope.draw16BitEnemy(
         }
     } else {
         val baseColor = if (flashWhite) Color.White else Color(enemy.archetype.colorHex)
-        when (enemy.archetype) {
-            EnemyArchetype.CRAWLING_SPIDER -> {
-                drawCircle(baseColor, tileSize * 0.28f, Offset(centerX, centerY))
-                drawCircle(Color.Black, tileSize * 0.12f, Offset(centerX, centerY))
-                drawLine(baseColor, Offset(centerX - tileSize * 0.35f, centerY - tileSize * 0.25f), Offset(centerX, centerY), 2f)
-                drawLine(baseColor, Offset(centerX + tileSize * 0.35f, centerY - tileSize * 0.25f), Offset(centerX, centerY), 2f)
-                drawLine(baseColor, Offset(centerX - tileSize * 0.35f, centerY + tileSize * 0.25f), Offset(centerX, centerY), 2f)
-                drawLine(baseColor, Offset(centerX + tileSize * 0.35f, centerY + tileSize * 0.25f), Offset(centerX, centerY), 2f)
-            }
-            EnemyArchetype.CRUCIBLE_TITAN -> {
-                drawRect(
-                    color = baseColor,
-                    topLeft = Offset(centerX - tileSize * 0.4f, centerY - tileSize * 0.4f),
-                    size = Size(tileSize * 0.8f, tileSize * 0.8f)
-                )
-                drawRect(
-                    color = ForgeAmber,
-                    topLeft = Offset(centerX - tileSize * 0.2f, centerY - tileSize * 0.2f),
-                    size = Size(tileSize * 0.4f, tileSize * 0.4f)
+        withTransform({
+            if (pulseScale != 1.0f) {
+                scale(
+                    scaleX = pulseScale,
+                    scaleY = pulseScale,
+                    pivot = Offset(centerX, centerY)
                 )
             }
-            else -> {
-                drawCircle(baseColor, tileSize * 0.34f, Offset(centerX, centerY))
-                drawCircle(Color.Black, tileSize * 0.14f, Offset(centerX, centerY))
+        }) {
+            when (enemy.archetype) {
+                EnemyArchetype.CRAWLING_SPIDER -> {
+                    drawCircle(baseColor, tileSize * 0.28f, Offset(centerX, centerY))
+                    drawCircle(Color.Black, tileSize * 0.12f, Offset(centerX, centerY))
+                    drawLine(baseColor, Offset(centerX - tileSize * 0.35f, centerY - tileSize * 0.25f), Offset(centerX, centerY), 2f)
+                    drawLine(baseColor, Offset(centerX + tileSize * 0.35f, centerY - tileSize * 0.25f), Offset(centerX, centerY), 2f)
+                    drawLine(baseColor, Offset(centerX - tileSize * 0.35f, centerY + tileSize * 0.25f), Offset(centerX, centerY), 2f)
+                    drawLine(baseColor, Offset(centerX + tileSize * 0.35f, centerY + tileSize * 0.25f), Offset(centerX, centerY), 2f)
+                }
+                EnemyArchetype.CRUCIBLE_TITAN -> {
+                    drawRect(
+                        color = baseColor,
+                        topLeft = Offset(centerX - tileSize * 0.4f, centerY - tileSize * 0.4f),
+                        size = Size(tileSize * 0.8f, tileSize * 0.8f)
+                    )
+                    drawRect(
+                        color = ForgeAmber,
+                        topLeft = Offset(centerX - tileSize * 0.2f, centerY - tileSize * 0.2f),
+                        size = Size(tileSize * 0.4f, tileSize * 0.4f)
+                    )
+                }
+                else -> {
+                    drawCircle(baseColor, tileSize * 0.34f, Offset(centerX, centerY))
+                    drawCircle(Color.Black, tileSize * 0.14f, Offset(centerX, centerY))
+                }
             }
         }
     }

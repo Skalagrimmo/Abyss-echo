@@ -743,6 +743,191 @@ class ExampleRobolectricTest {
         assertEquals(AmbientTrackProfile.VOID_MENU, vm.uiState.value.audioState.activeProfile)
         assertEquals(0f, vm.uiState.value.audioState.combatIntensity, 0.001f)
     }
+
+    @Test
+    fun `tactical grid BFS scales movement and attack cells by unit characteristics, hazards, and stunned state`() {
+        val floor = DungeonGenerator.generateFloor(1, seed = 2026L)
+        // Carve open 9x9 discovered walkable room around (10, 10)
+        for (x in 6..14) {
+            for (y in 6..14) {
+                floor.tiles[x][y].type = TileType.FLOOR
+                floor.tiles[x][y].isDiscovered = true
+                floor.tiles[x][y].isVisible = true
+            }
+        }
+        floor.tiles[11][10].type = TileType.TOXIC_MIRE // difficult terrain (+1 AP unless mitigated)
+        floor.props.clear()
+
+        val basePlayer = Player(
+            pos = GridPos(10, 10),
+            currentHp = 80,
+            maxHp = 80,
+            armor = 2,
+            sanity = 60,
+            currentAp = 2,
+            maxAp = 3,
+            freeStepsRemaining = 0,
+            archetype = Archetype.IRON_DESERTER
+        )
+        val baseGrid = CombatEngine.computeMovementGrid(basePlayer, floor.tiles, floor.props, emptyList())
+        assertEquals(1, baseGrid.moveCosts[GridPos(9, 10)])
+        assertEquals(2, baseGrid.moveCosts[GridPos(8, 10)])
+        assertFalse("With 2 AP, 3 steps away should be unreachable", baseGrid.moveCosts.containsKey(GridPos(7, 10)))
+        assertEquals(2, baseGrid.moveCosts[GridPos(11, 10)]) // 1 base + 1 mire extra AP
+
+        // Chrono Outcast + Clockwork Legs -> free stride steps + extended reach
+        val agilePlayer = basePlayer.copy(
+            archetype = Archetype.CHRONO_OUTCAST,
+            freeStepsRemaining = 2
+        )
+        val agileGrid = CombatEngine.computeMovementGrid(agilePlayer, floor.tiles, floor.props, emptyList())
+        assertEquals(0, agileGrid.moveCosts[GridPos(9, 10)])
+        assertEquals(0, agileGrid.moveCosts[GridPos(8, 10)])
+        assertEquals(1, agileGrid.moveCosts[GridPos(7, 10)])
+        assertTrue("2 AP + 2 free stride reaches 4 steps away", agileGrid.moveCosts.containsKey(GridPos(6, 10)))
+
+        // Ranged skill extends +1 range with VOID_CRIT_DARKNESS / high FOV
+        val eyeMutation = MutationCatalog.allMutations.first { it.id == "mut_abyssal_eye" }
+        val ocularPlayer = basePlayer.copy(fovRadius = 9, activeMutations = mutableListOf(eyeMutation))
+        assertEquals(3, CombatEngine.effectiveSkillRange(basePlayer, SkillCatalog.throwTorch))
+        assertEquals(4, CombatEngine.effectiveSkillRange(ocularPlayer, SkillCatalog.throwTorch))
+        val extendedTargets = CombatEngine.getValidTargetCells(ocularPlayer.pos, SkillCatalog.throwTorch, floor.tiles, floor.props, ocularPlayer)
+        assertTrue(extendedTargets.contains(GridPos(14, 10)))
+
+        // Stunned unit has empty movement & attack grid
+        val stunnedPlayer = agilePlayer.copy(statuses = mutableListOf(StatusEffect(StatusEffectType.STUNNED, 1)))
+        val stunnedGrid = CombatEngine.computeTacticalGrid(stunnedPlayer, SkillCatalog.strikeLight, floor.tiles, floor.props, emptyList(), null)
+        assertTrue(stunnedGrid.moveCosts.isEmpty())
+        assertTrue(stunnedGrid.attackCells.isEmpty())
+        assertFalse(stunnedGrid.canAffordSkill)
+
+        // Enemy threat overlay & explosive barrel AoE preview
+        val spider = Enemy(id = "e1", archetype = EnemyArchetype.CRAWLING_SPIDER, pos = GridPos(12, 10), currentHp = 18)
+        val barrel = TacticalProp(id = "b1", pos = GridPos(11, 9), type = TacticalPropType.EXPLOSIVE_BARREL, currentHp = 10)
+        val threats = CombatEngine.computeEnemyThreatCells(listOf(spider), floor.tiles, listOf(barrel))
+        assertTrue(threats.contains(GridPos(11, 10)))
+        val aoe = CombatEngine.computeAoePreviewCells(barrel.pos, SkillCatalog.throwTorch, floor.tiles, listOf(barrel))
+        assertTrue("Barrel target should preview 3x3 blast radius", aoe.contains(GridPos(12, 10)))
+    }
+
+    @Test
+    fun `two-tap tactical grid interaction previews path and AP cost before moving hero`() {
+        val vm = com.example.viewmodel.GameViewModel()
+        vm.startNewGame(Archetype.IRON_DESERTER)
+        vm.currentDungeon?.pendingDilemma = null
+
+        val startPos = vm.uiState.value.player.pos
+        val grid = vm.uiState.value.tacticalGrid
+        assertTrue("Initial tactical grid should have reachable cells", grid.moveCosts.isNotEmpty())
+
+        // Pick a safe reachable tile >= 2 steps away (or farthest reachable)
+        val destEntry = grid.movePaths.entries
+            .filter { entry -> entry.value.none { grid.hazardMoveCells.contains(it) } }
+            .maxByOrNull { it.value.size }
+            ?: grid.movePaths.entries.maxByOrNull { it.value.size }!!
+        val destPos = destEntry.key
+        val expectedCost = grid.moveCosts[destPos]!!
+        val startAp = vm.uiState.value.player.currentAp
+
+        // 1st tap: previews path and AP cost without moving player yet
+        vm.handleTileClick(destPos)
+        assertEquals(startPos, vm.uiState.value.player.pos)
+        assertEquals(destPos, vm.uiState.value.routePreview.targetPos)
+        assertEquals(expectedCost, vm.uiState.value.routePreview.apCost)
+        assertEquals(destEntry.value, vm.uiState.value.routePreview.path)
+
+        // 2nd tap: executes step-by-step movement to destination and clears preview
+        vm.handleTileClick(destPos)
+        assertEquals(destPos, vm.uiState.value.player.pos)
+        assertNull(vm.uiState.value.routePreview.targetPos)
+        assertEquals((startAp - expectedCost).coerceAtLeast(0), vm.uiState.value.player.currentAp)
+    }
+
+    @Test
+    fun `damage forecast accounts for armor combo guaranteed crit and lethality`() {
+        val player = Player(
+            pos = GridPos(10, 10),
+            currentHp = 80,
+            maxHp = 80,
+            armor = 2,
+            sanity = 70,
+            currentAp = 3,
+            maxAp = 3,
+            comboStage = ComboStage.READY,
+            comboHits = 0
+        )
+        val armoredEnemy = Enemy(
+            id = "armored_warden",
+            archetype = EnemyArchetype.CRUCIBLE_TITAN,
+            pos = GridPos(11, 10),
+            currentHp = 22,
+            maxHp = 60,
+            armor = 4
+        )
+
+        val baseForecast = CombatEngine.computeAttackDamageForecast(
+            player = player,
+            enemy = armoredEnemy,
+            skill = SkillCatalog.strikeLight,
+            isInRange = true,
+            canAffordAp = true
+        )
+        assertEquals(armoredEnemy.armor, baseForecast.armorBlocked)
+        assertTrue(baseForecast.maxDamage > baseForecast.minDamage)
+        assertTrue(baseForecast.critChancePercent in 1..85)
+        assertFalse(baseForecast.isGuaranteedLethal)
+
+        // Primed combo heavy strike guarantees crit and 2.0x combo multiplier -> min == max and lethal
+        val primedPlayer = player.copy(comboStage = ComboStage.HEAVY_PRIMED, comboHits = 3)
+        val finisherForecast = CombatEngine.computeAttackDamageForecast(
+            player = primedPlayer,
+            enemy = armoredEnemy,
+            skill = SkillCatalog.strikeHeavy,
+            isInRange = true,
+            canAffordAp = true
+        )
+        assertEquals(100, finisherForecast.critChancePercent)
+        assertEquals(finisherForecast.minDamage, finisherForecast.maxDamage)
+        assertTrue(finisherForecast.isGuaranteedLethal)
+        assertTrue(finisherForecast.isPotentialLethal)
+    }
+
+    @Test
+    fun `view model updates targetForecast when switching skills and target enemy`() {
+        val vm = com.example.viewmodel.GameViewModel()
+        vm.startNewGame(Archetype.IRON_DESERTER)
+
+        val playerPos = vm.uiState.value.player.pos
+        val currentFloor = vm.currentDungeon!!
+        val adjacentPos = GridPos(playerPos.x + 1, playerPos.y)
+        currentFloor.tiles[adjacentPos.x][adjacentPos.y].type = TileType.FLOOR
+        currentFloor.tiles[adjacentPos.x][adjacentPos.y].isDiscovered = true
+        currentFloor.tiles[adjacentPos.x][adjacentPos.y].isVisible = true
+        val testEnemy = Enemy(
+            id = "test_dummy",
+            archetype = EnemyArchetype.CRAWLING_SPIDER,
+            pos = adjacentPos,
+            currentHp = 18,
+            maxHp = 18,
+            armor = 1
+        )
+        currentFloor.enemies.clear()
+        currentFloor.enemies.add(testEnemy)
+        vm.selectEnemyTarget(testEnemy.id)
+
+        val lightForecast = vm.uiState.value.targetForecast
+        assertNotNull(lightForecast)
+        assertEquals(testEnemy.id, lightForecast!!.enemyId)
+        assertEquals(SkillCatalog.strikeLight.id, lightForecast.skillId)
+        assertTrue(lightForecast.isInRange)
+        assertTrue(lightForecast.canAffordAp)
+
+        vm.selectSkill(SkillCatalog.strikeHeavy)
+        val heavyForecast = vm.uiState.value.targetForecast
+        assertNotNull(heavyForecast)
+        assertEquals(SkillCatalog.strikeHeavy.id, heavyForecast!!.skillId)
+        assertTrue(heavyForecast.maxDamage > lightForecast.maxDamage)
+    }
 }
 
 

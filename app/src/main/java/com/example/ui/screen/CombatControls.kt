@@ -32,6 +32,8 @@ fun CombatControls(
     enemies: List<Enemy>,
     targetEnemyId: String?,
     selectedSkill: CombatSkill,
+    tacticalGrid: TacticalGridState = TacticalGridState(),
+    targetForecast: TargetDamageForecast? = null,
     onMove: (Int, Int) -> Unit,
     onSelectSkill: (CombatSkill) -> Unit,
     onAttackTarget: (Enemy, CombatSkill) -> Unit,
@@ -56,30 +58,88 @@ fun CombatControls(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // Target Info
+            // Target Info + Forecast Line
             if (targetEnemy != null) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
+                val activeForecast = targetForecast?.takeIf { it.enemyId == targetEnemy.id }
+                Column(
                     modifier = Modifier
+                        .weight(1f, fill = false)
+                        .padding(end = 6.dp)
                         .background(VoidBlack, CutCornerShape(3.dp))
-                        .border(1.dp, BloodCrimson.copy(alpha = 0.7f), CutCornerShape(3.dp))
-                        .padding(horizontal = 8.dp, vertical = 3.dp)
+                        .border(
+                            1.dp,
+                            when {
+                                activeForecast?.isInRange == true && activeForecast.isGuaranteedLethal -> ToxicGreen
+                                activeForecast?.isInRange == true && activeForecast.canAffordAp -> BloodCrimson
+                                else -> BloodCrimson.copy(alpha = 0.65f)
+                            },
+                            CutCornerShape(3.dp)
+                        )
+                        .padding(horizontal = 8.dp, vertical = 4.dp)
                 ) {
-                    Text(
-                        text = "🎯 ${targetEnemy.archetype.title}",
-                        color = BoneIvory,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        fontFamily = FontFamily.Monospace
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        text = "${targetEnemy.currentHp}/${targetEnemy.maxHp} ❤️",
-                        color = BloodCrimson,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        fontFamily = FontFamily.Monospace
-                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            text = "🎯 ${targetEnemy.archetype.title}",
+                            color = BoneIvory,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            fontFamily = FontFamily.Monospace
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "${targetEnemy.currentHp}/${targetEnemy.maxHp} ❤️",
+                            color = BloodCrimson,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
+
+                    if (activeForecast != null) {
+                        Spacer(modifier = Modifier.height(2.dp))
+                        val dmgText = if (activeForecast.minDamage == activeForecast.maxDamage) {
+                            "${activeForecast.maxDamage}"
+                        } else {
+                            "${activeForecast.minDamage}–${activeForecast.maxDamage}"
+                        }
+                        val statusColor = when {
+                            !activeForecast.isInRange || !activeForecast.canAffordAp -> AshGrey
+                            activeForecast.isGuaranteedLethal -> ToxicGreen
+                            else -> ForgeAmber
+                        }
+                        val forecastLabel = when {
+                            !activeForecast.canAffordAp -> "⏳ БРАК ОД • ОЦІНКА: $dmgText (🛡${activeForecast.armorBlocked})"
+                            !activeForecast.isInRange -> "🎯 ПОЗА ЗОНОЮ • $dmgText (🛡${activeForecast.armorBlocked})"
+                            else -> "⚔️ ПРОГНОЗ: $dmgText (Крит ${activeForecast.critChancePercent}%)"
+                        }
+                        val lethalTag = when {
+                            activeForecast.isGuaranteedLethal -> "💀 ФАТАЛЬНО"
+                            activeForecast.isPotentialLethal -> "⚡ КРИТ ВБ'Є"
+                            else -> null
+                        }
+                        Row(
+                            modifier = Modifier.testTag("target_damage_forecast"),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Text(
+                                text = forecastLabel,
+                                color = statusColor,
+                                fontSize = 9.sp,
+                                fontWeight = FontWeight.Bold,
+                                fontFamily = FontFamily.Monospace
+                            )
+                            if (lethalTag != null) {
+                                Text(
+                                    text = lethalTag,
+                                    color = if (activeForecast.isGuaranteedLethal) ToxicGreen else ForgeAmber,
+                                    fontSize = 9.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    fontFamily = FontFamily.Monospace
+                                )
+                            }
+                        }
+                    }
                 }
             } else {
                 Text(
@@ -119,8 +179,40 @@ fun CombatControls(
 
         Spacer(modifier = Modifier.height(4.dp))
 
-        // Combo chain status
-        ComboDisplay(comboStage = player.comboStage, comboHits = player.comboHits)
+        // Combo chain status + unit tactical range telemetry
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            ComboDisplay(comboStage = player.comboStage, comboHits = player.comboHits)
+
+            Row(
+                modifier = Modifier
+                    .testTag("tactical_range_telemetry")
+                    .background(VoidBlack.copy(alpha = 0.8f), CutCornerShape(4.dp))
+                    .border(1.dp, BorderMetal, CutCornerShape(4.dp))
+                    .padding(horizontal = 7.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                val strideTag = if (tacticalGrid.freeStrideRemaining > 0) "+${tacticalGrid.freeStrideRemaining}⚡" else ""
+                Text(
+                    text = "КРОК:${tacticalGrid.maxMoveSteps}$strideTag",
+                    color = if (tacticalGrid.maxMoveSteps > 0) SanityCyan else AshGrey,
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold,
+                    fontFamily = FontFamily.Monospace
+                )
+                Text(
+                    text = "АТК:${tacticalGrid.effectiveAttackRange}",
+                    color = if (tacticalGrid.canAffordSkill) ForgeAmber else AshGrey,
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold,
+                    fontFamily = FontFamily.Monospace
+                )
+            }
+        }
 
         Spacer(modifier = Modifier.height(6.dp))
 

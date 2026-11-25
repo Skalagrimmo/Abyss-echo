@@ -69,7 +69,10 @@ data class GameUiState(
     ),
     val isVictory: Boolean = false,
     val deathReason: String = "",
-    val audioState: AudioUiState = AudioUiState()
+    val audioState: AudioUiState = AudioUiState(),
+    val tacticalGrid: TacticalGridState = TacticalGridState(),
+    val routePreview: RoutePreviewState = RoutePreviewState(),
+    val targetForecast: TargetDamageForecast? = null
 )
 
 class GameViewModel : ViewModel() {
@@ -118,14 +121,30 @@ class GameViewModel : ViewModel() {
             pos = floor.playerStart,
             currentAp = 3
         )
+        player.freeStepsRemaining = CombatEngine.computeTurnFreeStride(player)
 
         DungeonGenerator.calculateFov(floor.tiles, player.pos, player.fovRadius)
-        val initialTargets = CombatEngine.getValidTargetCells(
-            player.pos,
-            _uiState.value.selectedSkill,
-            floor.tiles,
-            floor.props
+        val initialEnemy = floor.enemies.firstOrNull()
+        val initialEnemyId = initialEnemy?.id
+        val initialTargetPos = initialEnemy?.pos
+        val initialSkill = _uiState.value.selectedSkill
+        val initialGrid = CombatEngine.computeTacticalGrid(
+            player = player,
+            skill = initialSkill,
+            tiles = floor.tiles,
+            props = floor.props,
+            enemies = floor.enemies,
+            selectedTargetPos = initialTargetPos
         )
+        val initialForecast = initialEnemy?.let {
+            CombatEngine.computeAttackDamageForecast(
+                player = player,
+                enemy = it,
+                skill = initialSkill,
+                isInRange = initialGrid.attackCells.contains(it.pos),
+                canAffordAp = initialGrid.canAffordSkill
+            )
+        }
 
         _uiState.update { current ->
             current.copy(
@@ -135,8 +154,11 @@ class GameViewModel : ViewModel() {
                 player = player,
                 enemies = floor.enemies,
                 activeProps = floor.props.filter { !it.isDead },
-                validTargetCells = initialTargets,
-                targetEnemyId = floor.enemies.firstOrNull()?.id,
+                validTargetCells = initialGrid.attackCells,
+                tacticalGrid = initialGrid,
+                routePreview = RoutePreviewState(),
+                targetEnemyId = initialEnemyId,
+                targetForecast = initialForecast,
                 activeDilemma = null,
                 floatingFxList = emptyList(),
                 activeBanner = MilestoneBanner(
@@ -153,59 +175,128 @@ class GameViewModel : ViewModel() {
 
     private fun refreshTacticalGrid(playerPos: GridPos? = null) {
         val dungeon = currentDungeon ?: return
-        val pos = playerPos ?: _uiState.value.player.pos
-        val skill = _uiState.value.selectedSkill
-        val validTargets = CombatEngine.getValidTargetCells(pos, skill, dungeon.tiles, dungeon.props)
+        val currentState = _uiState.value
+        val player = currentState.player.let { if (playerPos != null && it.pos != playerPos) it.copy(pos = playerPos) else it }
+        val skill = currentState.selectedSkill
+        val aliveEnemies = dungeon.enemies.filter { !it.isDead }
+        val selectedEnemy = aliveEnemies.find { it.id == currentState.targetEnemyId } ?: aliveEnemies.firstOrNull()
+        val grid = CombatEngine.computeTacticalGrid(
+            player = player,
+            skill = skill,
+            tiles = dungeon.tiles,
+            props = dungeon.props,
+            enemies = aliveEnemies,
+            selectedTargetPos = selectedEnemy?.pos
+        )
+        val forecast = selectedEnemy?.let {
+            CombatEngine.computeAttackDamageForecast(
+                player = player,
+                enemy = it,
+                skill = skill,
+                isInRange = grid.attackCells.contains(it.pos),
+                canAffordAp = grid.canAffordSkill
+            )
+        }
         _uiState.update { current ->
+            val currentPreview = current.routePreview
+            val validPreview = if (currentPreview.targetPos != null && grid.moveCosts.containsKey(currentPreview.targetPos)) {
+                currentPreview
+            } else {
+                RoutePreviewState()
+            }
             current.copy(
                 activeProps = dungeon.props.filter { !it.isDead },
-                validTargetCells = validTargets,
-                enemies = dungeon.enemies.filter { !it.isDead }
+                validTargetCells = grid.attackCells,
+                tacticalGrid = grid,
+                routePreview = validPreview,
+                targetForecast = forecast,
+                enemies = aliveEnemies
             )
         }
         syncDynamicAudio()
     }
 
-    fun movePlayer(deltaX: Int, deltaY: Int) {
-        val dungeon = currentDungeon ?: return
-        val currentP = _uiState.value.player
-        if (currentP.isDead) return
+    fun clearRoutePreview() {
+        if (_uiState.value.routePreview.targetPos != null) {
+            _uiState.update { it.copy(routePreview = RoutePreviewState()) }
+        }
+    }
 
-        if (currentP.currentAp <= 0) {
-            triggerBanner("Немає ОД! Завершіть хід", "⏳", 0xFFEF4444)
-            return
+    fun moveAlongRoute(path: List<GridPos>) {
+        if (path.isEmpty()) return
+        clearRoutePreview()
+        for (stepPos in path) {
+            val currentP = _uiState.value.player
+            if (currentP.isDead || _uiState.value.currentScreen != ScreenState.DUNGEON) break
+            val dx = stepPos.x - currentP.pos.x
+            val dy = stepPos.y - currentP.pos.y
+            if (kotlin.math.abs(dx) > 1 || kotlin.math.abs(dy) > 1) break
+            val prevFloor = _uiState.value.currentFloorNumber
+            val shouldContinue = executeSingleMoveStep(dx, dy)
+            if (!shouldContinue || _uiState.value.currentFloorNumber != prevFloor) break
+        }
+    }
+
+    fun movePlayer(deltaX: Int, deltaY: Int) {
+        clearRoutePreview()
+        executeSingleMoveStep(deltaX, deltaY)
+    }
+
+    private fun executeSingleMoveStep(deltaX: Int, deltaY: Int): Boolean {
+        val dungeon = currentDungeon ?: return false
+        val currentP = _uiState.value.player
+        if (currentP.isDead) return false
+
+        if (currentP.hasStatus(StatusEffectType.STUNNED)) {
+            triggerBanner("Ви оглушені і не можете рухатись!", "💫", 0xFFEF4444)
+            return false
         }
 
         val targetPos = GridPos(currentP.pos.x + deltaX, currentP.pos.y + deltaY)
         val width = dungeon.tiles.size
         val height = dungeon.tiles[0].size
 
-        if (targetPos.x !in 0 until width || targetPos.y !in 0 until height) return
+        if (targetPos.x !in 0 until width || targetPos.y !in 0 until height) return false
 
         // If enemy at target cell -> attack
         val enemyAtTarget = dungeon.enemies.find { it.pos == targetPos && !it.isDead }
         if (enemyAtTarget != null) {
             executeAttack(enemyAtTarget, targetPos, _uiState.value.selectedSkill)
-            return
+            return false
         }
 
         // If blocking prop at target cell (barrel/crate) -> attack or alert
         val propAtTarget = dungeon.props.find { !it.isDead && it.pos == targetPos }
         if (propAtTarget != null && propAtTarget.type.blocksMovement) {
-            // Attack the obstacle/barrel directly
             executeAttack(null, targetPos, _uiState.value.selectedSkill)
-            return
+            return false
         }
 
         val tile = dungeon.tiles[targetPos.x][targetPos.y]
-        if (!tile.isWalkable) return
+        if (!tile.isWalkable) return false
+
+        val baseStepAp = if (currentP.freeStepsRemaining > 0) 0 else 1
+        val extraAp = CombatEngine.tileMoveExtraAp(currentP, tile)
+        val totalStepCost = baseStepAp + extraAp
+
+        if (currentP.currentAp < totalStepCost) {
+            triggerBanner("Немає ОД! Завершіть хід", "⏳", 0xFFEF4444)
+            return false
+        }
+
+        if (currentP.freeStepsRemaining > 0) {
+            currentP.freeStepsRemaining--
+            currentP.currentAp = (currentP.currentAp - extraAp).coerceAtLeast(0)
+        } else {
+            currentP.currentAp = (currentP.currentAp - totalStepCost).coerceAtLeast(0)
+        }
 
         currentP.pos = targetPos
-        currentP.currentAp--
         currentP.torchTurns = (currentP.torchTurns - 1).coerceAtLeast(0)
 
         SoundSynthesizer.playStep()
 
+        var interrupted = false
         // Trap interaction (Spikes or Steam Vent)
         if (propAtTarget != null && !propAtTarget.type.blocksMovement) {
             when (propAtTarget.type) {
@@ -214,12 +305,14 @@ class GameViewModel : ViewModel() {
                     currentP.statuses.add(StatusEffect(StatusEffectType.BLEEDING, 2))
                     addFloatingFx(targetPos.x, targetPos.y, "-6 ⚙️ ШИПИ!", 0xFFEF4444)
                     SoundSynthesizer.playStrike()
+                    interrupted = true
                 }
                 TacticalPropType.STEAM_PRESSURE_VENT -> {
                     currentP.currentHp = (currentP.currentHp - 4).coerceAtLeast(1)
                     currentP.statuses.add(StatusEffect(StatusEffectType.BURNING, 2))
                     addFloatingFx(targetPos.x, targetPos.y, "-4 ♨️ ПАРА!", 0xFFF59E0B)
                     SoundSynthesizer.playHeavySlam()
+                    interrupted = true
                 }
                 else -> {}
             }
@@ -245,10 +338,10 @@ class GameViewModel : ViewModel() {
             if (nextFloor > 3) {
                 _uiState.update { it.copy(currentScreen = ScreenState.GAME_OVER, isVictory = true) }
                 syncDynamicAudio()
-                return
+                return false
             } else {
                 loadFloor(nextFloor)
-                return
+                return false
             }
         }
 
@@ -258,6 +351,7 @@ class GameViewModel : ViewModel() {
             dungeon.pendingDilemma = null
             _uiState.update { it.copy(activeDilemma = dilemma, currentScreen = ScreenState.DILEMMA_POPUP) }
             SoundSynthesizer.playEldritchDrone()
+            interrupted = true
         }
 
         DungeonGenerator.calculateFov(dungeon.tiles, currentP.pos, currentP.fovRadius)
@@ -265,53 +359,89 @@ class GameViewModel : ViewModel() {
 
         _uiState.update { it.copy(player = currentP.copy()) }
         refreshTacticalGrid(currentP.pos)
+        return !interrupted
     }
 
     fun selectSkill(skill: CombatSkill) {
-        _uiState.update { it.copy(selectedSkill = skill) }
+        _uiState.update { it.copy(selectedSkill = skill, routePreview = RoutePreviewState()) }
         refreshTacticalGrid()
     }
 
     fun selectEnemyTarget(enemyId: String) {
         _uiState.update { it.copy(targetEnemyId = enemyId) }
+        refreshTacticalGrid()
     }
 
     fun handleTileClick(pos: GridPos) {
         val dungeon = currentDungeon ?: return
-        val player = _uiState.value.player
+        val state = _uiState.value
+        val player = state.player
         if (player.isDead) return
+
+        if (pos == player.pos) {
+            clearRoutePreview()
+            return
+        }
 
         val enemyAtPos = dungeon.enemies.find { !it.isDead && it.pos == pos }
         val propAtPos = dungeon.props.find { !it.isDead && it.pos == pos }
-        val currentSkill = _uiState.value.selectedSkill
-        val validTargets = _uiState.value.validTargetCells
+        val currentSkill = state.selectedSkill
+        val validTargets = state.validTargetCells
 
-        // If tapped cell is in tactical attack range
+        // Direct tap on an enemy or blocking prop within tactical attack range executes attack immediately
         if (validTargets.contains(pos)) {
             if (enemyAtPos != null) {
+                clearRoutePreview()
                 selectEnemyTarget(enemyAtPos.id)
                 executeAttack(enemyAtPos, pos, currentSkill)
                 return
-            } else if (propAtPos != null) {
-                executeAttack(null, pos, currentSkill)
-                return
-            } else if (currentSkill.isAreaEffect) {
+            } else if (propAtPos != null && propAtPos.type.blocksMovement) {
+                clearRoutePreview()
                 executeAttack(null, pos, currentSkill)
                 return
             }
         }
 
-        // If clicked on an enemy outside current skill range, select target
+        // Two-tap tactical grid movement: 1st tap previews path + AP cost, 2nd tap executes step-by-step
+        val grid = state.tacticalGrid
+        val pathToCell = grid.movePaths[pos]
+        val costToCell = grid.moveCosts[pos]
+        if (pathToCell != null && costToCell != null) {
+            if (state.routePreview.targetPos == pos) {
+                moveAlongRoute(pathToCell)
+            } else {
+                val crossesHazard = pathToCell.any { grid.hazardMoveCells.contains(it) }
+                val endsInThreat = grid.enemyThreatCells.contains(pos)
+                _uiState.update {
+                    it.copy(
+                        routePreview = RoutePreviewState(
+                            targetPos = pos,
+                            path = pathToCell,
+                            apCost = costToCell,
+                            crossesHazard = crossesHazard,
+                            endsInThreatZone = endsInThreat
+                        )
+                    )
+                }
+            }
+            return
+        }
+
+        // AoE on non-walkable/outside-move cell within valid attack range
+        if (validTargets.contains(pos) && currentSkill.isAreaEffect) {
+            clearRoutePreview()
+            executeAttack(null, pos, currentSkill)
+            return
+        }
+
+        // Clicking an enemy outside current skill range selects it and updates target/threat reticle
         if (enemyAtPos != null) {
+            clearRoutePreview()
             selectEnemyTarget(enemyAtPos.id)
             return
         }
 
-        // If adjacent cell and walkable, move player
-        val dist = player.pos.chebyshevDistance(pos)
-        if (dist == 1) {
-            movePlayer(pos.x - player.pos.x, pos.y - player.pos.y)
-        }
+        clearRoutePreview()
     }
 
     fun attackEnemy(enemy: Enemy, skill: CombatSkill) {
@@ -623,6 +753,7 @@ class GameViewModel : ViewModel() {
             apRestored++
         }
         player.currentAp = apRestored
+        player.freeStepsRemaining = CombatEngine.computeTurnFreeStride(player)
 
         // Trigger biomechanical mutation surge effect for turn
         if (player.activeMutations.isNotEmpty()) {
@@ -665,7 +796,8 @@ class GameViewModel : ViewModel() {
                 turnCount = current.turnCount + 1,
                 player = player.copy(),
                 enemies = dungeon.enemies.filter { !it.isDead },
-                activeProps = dungeon.props.filter { !it.isDead }
+                activeProps = dungeon.props.filter { !it.isDead },
+                routePreview = RoutePreviewState()
             )
         }
         refreshTacticalGrid(player.pos)
@@ -785,6 +917,7 @@ class GameViewModel : ViewModel() {
         if (item.torchAdd > 0) addFloatingFx(player.pos.x, player.pos.y, "+${item.torchAdd} 🔥", 0xFFF59E0B)
 
         _uiState.update { it.copy(player = player.copy(), availableInventory = items) }
+        refreshTacticalGrid()
     }
 
     fun craftItem(recipe: Recipe) {
@@ -819,8 +952,10 @@ class GameViewModel : ViewModel() {
                 pendingReturnMutationSurge = null
                 triggerMapMutationSurge(queued)
             }
+            refreshTacticalGrid()
+        } else {
+            syncDynamicAudio()
         }
-        syncDynamicAudio()
     }
 
     fun setMusicVolume(volume: Float) {

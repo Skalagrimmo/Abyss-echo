@@ -1,6 +1,7 @@
 package com.example.engine
 
 import com.example.model.*
+import java.util.PriorityQueue
 import kotlin.math.abs
 import kotlin.random.Random
 
@@ -79,19 +80,199 @@ object CombatEngine {
         return true
     }
 
+    fun computeTurnFreeStride(player: Player): Int {
+        if (player.hasStatus(StatusEffectType.STUNNED)) return 0
+        var stride = 0
+        if (player.archetype == Archetype.CHRONO_OUTCAST) stride += 1
+        if (EvolutionEngine.getTraitRank(player, EvolutionTrait.CLOCKWORK_AP) > 0) stride += 1
+        if (player.hasStatus(StatusEffectType.ADRENALINE)) stride += 1
+        return stride
+    }
+
+    fun hasHazardMobilityMitigation(player: Player): Boolean {
+        return EvolutionEngine.getTraitRank(player, EvolutionTrait.THERMAL_IMMUNITY) > 0 ||
+            EvolutionEngine.getTraitRank(player, EvolutionTrait.TOXIC_STEP) > 0 ||
+            EvolutionEngine.isMinorSynergyActive(player, MutationCategory.CHTHONIC_FLESH)
+    }
+
+    fun tileMoveExtraAp(player: Player, tile: Tile): Int {
+        val isSlowTerrain = tile.type == TileType.TOXIC_MIRE || tile.type == TileType.OIL_SLICK
+        return if (isSlowTerrain && !hasHazardMobilityMitigation(player)) 1 else 0
+    }
+
+    private fun tileHazardScore(player: Player, tile: Tile, props: List<TacticalProp>): Int {
+        var score = 0
+        val hasTrap = props.any {
+            !it.isDead && it.pos == tile.pos &&
+                (it.type == TacticalPropType.SPIKE_PLATE || it.type == TacticalPropType.STEAM_PRESSURE_VENT)
+        }
+        if (hasTrap) score += 10
+        if ((tile.type == TileType.EMBER_HEARTH || tile.type == TileType.TOXIC_MIRE) &&
+            !hasHazardMobilityMitigation(player)
+        ) {
+            score += 4
+        }
+        if (tile.element == TileElement.BURNING || tile.element == TileElement.ELECTRIFIED || tile.element == TileElement.POISON_SMOKE) {
+            score += 5
+        }
+        return score
+    }
+
+    fun effectiveSkillRange(player: Player?, skill: CombatSkill): Int {
+        var range = skill.range
+        if (player == null) return range
+        when (skill.distanceType) {
+            AttackDistanceType.RANGED -> {
+                if (EvolutionEngine.getTraitRank(player, EvolutionTrait.VOID_CRIT_DARKNESS) > 0 || player.fovRadius >= 8) {
+                    range += 1
+                }
+            }
+            AttackDistanceType.REACH -> {
+                if (EvolutionEngine.getTraitRank(player, EvolutionTrait.SIPHON_CRIT) >= 3) {
+                    range += 1
+                }
+            }
+            else -> {}
+        }
+        return range
+    }
+
+    data class MovementGridResult(
+        val moveCosts: Map<GridPos, Int>,
+        val movePaths: Map<GridPos, List<GridPos>>,
+        val hazardCells: Set<GridPos>
+    )
+
+    private data class BfsMoveNode(
+        val pos: GridPos,
+        val apCost: Int,
+        val steps: Int,
+        val hazardScore: Int
+    ) : Comparable<BfsMoveNode> {
+        override fun compareTo(other: BfsMoveNode): Int {
+            if (apCost != other.apCost) return apCost.compareTo(other.apCost)
+            if (hazardScore != other.hazardScore) return hazardScore.compareTo(other.hazardScore)
+            return steps.compareTo(other.steps)
+        }
+    }
+
+    fun computeMovementGrid(
+        player: Player,
+        tiles: Array<Array<Tile>>,
+        props: List<TacticalProp>,
+        enemies: List<Enemy>
+    ): MovementGridResult {
+        if (player.isDead || player.hasStatus(StatusEffectType.STUNNED)) {
+            return MovementGridResult(emptyMap(), emptyMap(), emptySet())
+        }
+        val maxAp = player.currentAp
+        if (maxAp <= 0 && player.freeStepsRemaining <= 0) {
+            return MovementGridResult(emptyMap(), emptyMap(), emptySet())
+        }
+
+        val w = tiles.size
+        val h = tiles[0].size
+        val blockedPositions = buildSet {
+            props.filter { !it.isDead && it.type.blocksMovement }.forEach { add(it.pos) }
+            enemies.filter { !it.isDead }.forEach { add(it.pos) }
+        }
+
+        val bestCost = mutableMapOf<GridPos, Triple<Int, Int, Int>>() // ap, hazard, steps
+        val parent = mutableMapOf<GridPos, GridPos?>()
+        val hazardCells = mutableSetOf<GridPos>()
+        val pq = PriorityQueue<BfsMoveNode>()
+
+        bestCost[player.pos] = Triple(0, 0, 0)
+        parent[player.pos] = null
+        pq.add(BfsMoveNode(player.pos, 0, 0, 0))
+
+        while (pq.isNotEmpty()) {
+            val current = pq.poll() ?: break
+            val recorded = bestCost[current.pos]
+            if (recorded != null && (current.apCost > recorded.first ||
+                    (current.apCost == recorded.first && current.hazardScore > recorded.second))
+            ) {
+                continue
+            }
+
+            for (dx in -1..1) {
+                for (dy in -1..1) {
+                    if (dx == 0 && dy == 0) continue
+                    val nx = current.pos.x + dx
+                    val ny = current.pos.y + dy
+                    if (nx !in 0 until w || ny !in 0 until h) continue
+
+                    val nextPos = GridPos(nx, ny)
+                    val tile = tiles[nx][ny]
+                    if (!tile.isWalkable || !tile.isDiscovered) continue
+                    if (blockedPositions.contains(nextPos)) continue
+
+                    val baseStepAp = if (current.steps < player.freeStepsRemaining) 0 else 1
+                    val extraAp = tileMoveExtraAp(player, tile)
+                    val nextAp = current.apCost + baseStepAp + extraAp
+                    if (nextAp > maxAp) continue
+
+                    val tileHazard = tileHazardScore(player, tile, props)
+                    if (extraAp > 0 || tileHazard > 0) {
+                        hazardCells.add(nextPos)
+                    }
+                    val nextHazard = current.hazardScore + tileHazard
+                    val nextSteps = current.steps + 1
+
+                    val prevBest = bestCost[nextPos]
+                    val isBetter = prevBest == null ||
+                        nextAp < prevBest.first ||
+                        (nextAp == prevBest.first && nextHazard < prevBest.second) ||
+                        (nextAp == prevBest.first && nextHazard == prevBest.second && nextSteps < prevBest.third)
+
+                    if (isBetter) {
+                        bestCost[nextPos] = Triple(nextAp, nextHazard, nextSteps)
+                        parent[nextPos] = current.pos
+                        pq.add(BfsMoveNode(nextPos, nextAp, nextSteps, nextHazard))
+                    }
+                }
+            }
+        }
+
+        val moveCosts = mutableMapOf<GridPos, Int>()
+        val movePaths = mutableMapOf<GridPos, List<GridPos>>()
+        for ((pos, triple) in bestCost) {
+            if (pos == player.pos) continue
+            moveCosts[pos] = triple.first
+            val path = mutableListOf<GridPos>()
+            var cursor: GridPos? = pos
+            while (cursor != null && cursor != player.pos) {
+                path.add(cursor)
+                cursor = parent[cursor]
+            }
+            path.reverse()
+            movePaths[pos] = path
+        }
+
+        return MovementGridResult(
+            moveCosts = moveCosts,
+            movePaths = movePaths,
+            hazardCells = hazardCells.intersect(moveCosts.keys)
+        )
+    }
+
     /**
-     * Computes all valid targeted cells for a given skill from player position.
+     * Computes all valid targeted cells for a given skill from player position,
+     * scaling range dynamically by unit characteristics when player is provided.
      */
     fun getValidTargetCells(
         playerPos: GridPos,
         skill: CombatSkill,
         tiles: Array<Array<Tile>>,
-        props: List<TacticalProp>
+        props: List<TacticalProp>,
+        player: Player? = null
     ): Set<GridPos> {
+        if (player != null && player.hasStatus(StatusEffectType.STUNNED)) return emptySet()
+
         val validCells = mutableSetOf<GridPos>()
         val w = tiles.size
         val h = tiles[0].size
-        val r = skill.range
+        val r = effectiveSkillRange(player, skill)
 
         for (dx in -r..r) {
             for (dy in -r..r) {
@@ -104,27 +285,23 @@ object CombatEngine {
 
                 when (skill.distanceType) {
                     AttackDistanceType.MELEE -> {
-                        // Exactly distance 1
                         if (dist == 1) {
                             validCells.add(targetPos)
                         }
                     }
                     AttackDistanceType.REACH -> {
-                        // Range 1 to 2, can pierce through low obstacles
-                        if (dist in 1..2) {
+                        // Can pierce through low obstacles
+                        if (dist in 1..r) {
                             validCells.add(targetPos)
                         }
                     }
                     AttackDistanceType.RANGED -> {
                         // Requires line-of-sight
-                        if (dist in 1..r) {
-                            if (hasLineOfSight(playerPos, targetPos, tiles, props)) {
-                                validCells.add(targetPos)
-                            }
+                        if (dist in 1..r && hasLineOfSight(playerPos, targetPos, tiles, props)) {
+                            validCells.add(targetPos)
                         }
                     }
                     AttackDistanceType.AREA -> {
-                        // Target any cell within range
                         if (dist in 1..r) {
                             validCells.add(targetPos)
                         }
@@ -133,6 +310,204 @@ object CombatEngine {
             }
         }
         return validCells
+    }
+
+    fun computeAoePreviewCells(
+        targetPos: GridPos?,
+        skill: CombatSkill,
+        tiles: Array<Array<Tile>>,
+        props: List<TacticalProp>
+    ): Set<GridPos> {
+        if (targetPos == null) return emptySet()
+        val w = tiles.size
+        val h = tiles[0].size
+        val cells = mutableSetOf<GridPos>()
+
+        if (skill.isAreaEffect) {
+            val radius = skill.areaRadius.coerceAtLeast(1)
+            for (dx in -radius..radius) {
+                for (dy in -radius..radius) {
+                    val pos = GridPos(targetPos.x + dx, targetPos.y + dy)
+                    if (pos.x in 0 until w && pos.y in 0 until h && tiles[pos.x][pos.y].isWalkable) {
+                        cells.add(pos)
+                    }
+                }
+            }
+        }
+
+        // Also include 3x3 blast radius if targeting an explosive barrel directly or via AoE
+        val explosiveOrigin = props.find { !it.isDead && it.type.isExplosive && (it.pos == targetPos || cells.contains(it.pos)) }
+        if (explosiveOrigin != null) {
+            for (dx in -1..1) {
+                for (dy in -1..1) {
+                    val pos = GridPos(explosiveOrigin.pos.x + dx, explosiveOrigin.pos.y + dy)
+                    if (pos.x in 0 until w && pos.y in 0 until h && tiles[pos.x][pos.y].isWalkable) {
+                        cells.add(pos)
+                    }
+                }
+            }
+        }
+        return cells
+    }
+
+    fun computeEnemyThreatCells(
+        enemies: List<Enemy>,
+        tiles: Array<Array<Tile>>,
+        props: List<TacticalProp>
+    ): Set<GridPos> {
+        val w = tiles.size
+        val h = tiles[0].size
+        val threat = mutableSetOf<GridPos>()
+
+        for (enemy in enemies) {
+            if (enemy.isDead || enemy.hasStatus(StatusEffectType.STUNNED)) continue
+            if (enemy.pos.x !in 0 until w || enemy.pos.y !in 0 until h) continue
+            if (!tiles[enemy.pos.x][enemy.pos.y].isVisible) continue
+
+            val range = enemy.archetype.range.coerceAtLeast(1)
+            for (dx in -range..range) {
+                for (dy in -range..range) {
+                    if (dx == 0 && dy == 0) continue
+                    val pos = GridPos(enemy.pos.x + dx, enemy.pos.y + dy)
+                    if (pos.x !in 0 until w || pos.y !in 0 until h) continue
+                    val dist = enemy.pos.chebyshevDistance(pos)
+                    if (dist !in 1..range) continue
+                    if (!tiles[pos.x][pos.y].isWalkable) continue
+                    if (range == 1 || hasLineOfSight(enemy.pos, pos, tiles, props)) {
+                        threat.add(pos)
+                    }
+                }
+            }
+        }
+        return threat
+    }
+
+    fun computeTacticalGrid(
+        player: Player,
+        skill: CombatSkill,
+        tiles: Array<Array<Tile>>,
+        props: List<TacticalProp>,
+        enemies: List<Enemy>,
+        selectedTargetPos: GridPos?
+    ): TacticalGridState {
+        val movement = computeMovementGrid(player, tiles, props, enemies)
+        val attackCells = getValidTargetCells(player.pos, skill, tiles, props, player)
+        val aoeTarget = selectedTargetPos?.takeIf { attackCells.contains(it) }
+        val aoePreview = computeAoePreviewCells(aoeTarget, skill, tiles, props)
+        val enemyThreats = computeEnemyThreatCells(enemies, tiles, props)
+        val maxSteps = movement.movePaths.values.maxOfOrNull { it.size } ?: 0
+
+        return TacticalGridState(
+            moveCosts = movement.moveCosts,
+            movePaths = movement.movePaths,
+            hazardMoveCells = movement.hazardCells,
+            attackCells = attackCells,
+            aoePreviewCells = aoePreview,
+            enemyThreatCells = enemyThreats,
+            canAffordSkill = !player.hasStatus(StatusEffectType.STUNNED) && player.currentAp >= skill.apCost,
+            effectiveAttackRange = effectiveSkillRange(player, skill),
+            maxMoveSteps = maxSteps,
+            freeStrideRemaining = player.freeStepsRemaining
+        )
+    }
+
+    data class AttackDamageProfile(
+        val rawNormalDamage: Int,
+        val rawCritDamage: Int,
+        val critChance: Float,
+        val guaranteedCrit: Boolean
+    )
+
+    fun evaluateAttackDamageProfile(
+        player: Player,
+        skill: CombatSkill
+    ): AttackDamageProfile {
+        var comboMultiplier = 1.0f
+        var guaranteedCrit = false
+        var critChance = 0.15f
+        if (player.sanity < 30) critChance += 0.25f
+        if (EvolutionEngine.isMinorSynergyActive(player, MutationCategory.CHTHONIC_FLESH)) {
+            critChance += 0.12f
+        }
+        val voidCritRank = EvolutionEngine.getTraitRank(player, EvolutionTrait.VOID_CRIT_DARKNESS)
+        if (voidCritRank > 0 && (player.torchTurns <= 25 || player.sanity < 50)) {
+            critChance += 0.10f + (0.10f * voidCritRank)
+        }
+        val cappedCritChance = critChance.coerceIn(0f, 0.85f)
+
+        when (skill.id) {
+            SkillCatalog.strikeLight.id -> {
+                when (player.comboStage) {
+                    ComboStage.LIGHT_1 -> comboMultiplier = 1.25f
+                    ComboStage.LIGHT_2 -> comboMultiplier = 1.5f
+                    else -> {}
+                }
+            }
+            SkillCatalog.strikeHeavy.id -> {
+                if (player.comboStage == ComboStage.HEAVY_PRIMED || player.comboHits >= 2) {
+                    comboMultiplier = 2.0f
+                    guaranteedCrit = true
+                }
+            }
+            else -> {}
+        }
+
+        var evolutionDmgMult = 1.0f
+        val frenzyRank = EvolutionEngine.getTraitRank(player, EvolutionTrait.BLOOD_FRENZY)
+        if (frenzyRank > 0 && player.maxHp > 0) {
+            val missingRatio = (1f - (player.currentHp.toFloat() / player.maxHp.toFloat())).coerceIn(0f, 1f)
+            val maxBonus = when (frenzyRank) {
+                1 -> 0.50f
+                2 -> 0.75f
+                else -> 1.00f
+            }
+            evolutionDmgMult += missingRatio * maxBonus
+        }
+        if (skill.id != SkillCatalog.strikeLight.id &&
+            EvolutionEngine.isMinorSynergyActive(player, MutationCategory.OCCULT_SIGIL)
+        ) {
+            evolutionDmgMult += 0.15f
+        }
+        if (EvolutionEngine.isApexSynergyActive(player, MutationCategory.OCCULT_SIGIL)) {
+            evolutionDmgMult += 0.20f
+        }
+
+        val baseAtk = player.totalAttackPower()
+        val rawNormal = ((skill.baseDamage + (baseAtk / 2)) * comboMultiplier * evolutionDmgMult).toInt()
+        val rawCrit = (rawNormal * 1.5f).toInt()
+        return AttackDamageProfile(
+            rawNormalDamage = rawNormal,
+            rawCritDamage = rawCrit,
+            critChance = if (guaranteedCrit) 1.0f else cappedCritChance,
+            guaranteedCrit = guaranteedCrit
+        )
+    }
+
+    fun computeAttackDamageForecast(
+        player: Player,
+        enemy: Enemy,
+        skill: CombatSkill,
+        isInRange: Boolean,
+        canAffordAp: Boolean
+    ): TargetDamageForecast {
+        val profile = evaluateAttackDamageProfile(player, skill)
+        val normalNet = (profile.rawNormalDamage - enemy.armor).coerceAtLeast(2)
+        val critNet = (profile.rawCritDamage - enemy.armor).coerceAtLeast(2)
+        val minDmg = if (profile.guaranteedCrit) critNet else normalNet
+        val maxDmg = critNet
+        val critPct = if (profile.guaranteedCrit) 100 else (profile.critChance * 100f).toInt().coerceIn(0, 100)
+        return TargetDamageForecast(
+            enemyId = enemy.id,
+            skillId = skill.id,
+            minDamage = minDmg,
+            maxDamage = maxDmg,
+            critChancePercent = critPct,
+            isGuaranteedLethal = minDmg >= enemy.currentHp,
+            isPotentialLethal = maxDmg >= enemy.currentHp,
+            isInRange = isInRange,
+            canAffordAp = canAffordAp,
+            armorBlocked = enemy.armor
+        )
     }
 
     fun executePlayerAttack(
@@ -159,18 +534,10 @@ object CombatEngine {
             player.currentHp = (player.currentHp - skill.selfHpCost).coerceAtLeast(1)
         }
 
-        // Combo & Evolution Crit calculation
-        var comboMultiplier = 1.0f
-        var critChance = 0.15f
-        if (player.sanity < 30) critChance += 0.25f
-        if (EvolutionEngine.isMinorSynergyActive(player, MutationCategory.CHTHONIC_FLESH)) {
-            critChance += 0.12f
-        }
-        val voidCritRank = EvolutionEngine.getTraitRank(player, EvolutionTrait.VOID_CRIT_DARKNESS)
-        if (voidCritRank > 0 && (player.torchTurns <= 25 || player.sanity < 50)) {
-            critChance += 0.10f + (0.10f * voidCritRank)
-        }
-        var isCrit = random.nextFloat() < critChance.coerceAtMost(0.85f)
+        // Single-source damage & crit calculation BEFORE advancing combo stage
+        val dmgProfile = evaluateAttackDamageProfile(player, skill)
+        val isCrit = dmgProfile.guaranteedCrit || random.nextFloat() < dmgProfile.critChance
+        val rawDmg = if (isCrit) dmgProfile.rawCritDamage else dmgProfile.rawNormalDamage
 
         val nextStage = when (skill.id) {
             SkillCatalog.strikeLight.id -> {
@@ -181,22 +548,16 @@ object CombatEngine {
                     }
                     ComboStage.LIGHT_1 -> {
                         player.comboHits = 2
-                        comboMultiplier = 1.25f
                         ComboStage.LIGHT_2
                     }
                     ComboStage.LIGHT_2 -> {
                         player.comboHits = 3
-                        comboMultiplier = 1.5f
                         ComboStage.HEAVY_PRIMED
                     }
                     ComboStage.HEAVY_PRIMED -> ComboStage.HEAVY_PRIMED
                 }
             }
             SkillCatalog.strikeHeavy.id -> {
-                if (player.comboStage == ComboStage.HEAVY_PRIMED || player.comboHits >= 2) {
-                    comboMultiplier = 2.0f
-                    isCrit = true
-                }
                 player.comboHits = 0
                 ComboStage.READY
             }
@@ -206,32 +567,6 @@ object CombatEngine {
             }
         }
         player.comboStage = nextStage
-
-        // Blood Frenzy & Occult Sigil synergy multipliers
-        var evolutionDmgMult = 1.0f
-        val frenzyRank = EvolutionEngine.getTraitRank(player, EvolutionTrait.BLOOD_FRENZY)
-        if (frenzyRank > 0 && player.maxHp > 0) {
-            val missingRatio = (1f - (player.currentHp.toFloat() / player.maxHp.toFloat())).coerceIn(0f, 1f)
-            val maxBonus = when (frenzyRank) {
-                1 -> 0.50f
-                2 -> 0.75f
-                else -> 1.00f
-            }
-            evolutionDmgMult += missingRatio * maxBonus
-        }
-        if (skill.id != SkillCatalog.strikeLight.id &&
-            EvolutionEngine.isMinorSynergyActive(player, MutationCategory.OCCULT_SIGIL)
-        ) {
-            evolutionDmgMult += 0.15f
-        }
-        if (EvolutionEngine.isApexSynergyActive(player, MutationCategory.OCCULT_SIGIL)) {
-            evolutionDmgMult += 0.20f
-        }
-
-        // Calculate total damage
-        val baseAtk = player.totalAttackPower()
-        var rawDmg = ((skill.baseDamage + (baseAtk / 2)) * comboMultiplier * evolutionDmgMult).toInt()
-        if (isCrit) rawDmg = (rawDmg * 1.5f).toInt()
 
         var netDmg = rawDmg
         var enemyDied = false

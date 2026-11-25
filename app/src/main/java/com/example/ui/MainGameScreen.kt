@@ -267,6 +267,8 @@ private fun DungeonPlayLayout(
                 enemies = state.enemies,
                 props = state.activeProps,
                 validTargetCells = state.validTargetCells,
+                tacticalGrid = state.tacticalGrid,
+                routePreview = state.routePreview,
                 selectedSkill = state.selectedSkill,
                 targetEnemyId = state.targetEnemyId,
                 floatingFxList = state.floatingFxList,
@@ -277,6 +279,9 @@ private fun DungeonPlayLayout(
                 activeBanner = state.activeBanner,
                 onTileTap = { pos ->
                     viewModel.handleTileClick(pos)
+                },
+                onClearRoutePreview = {
+                    viewModel.clearRoutePreview()
                 },
                 modifier = Modifier.fillMaxSize()
             )
@@ -290,6 +295,8 @@ private fun DungeonPlayLayout(
             enemies = state.enemies,
             targetEnemyId = state.targetEnemyId,
             selectedSkill = state.selectedSkill,
+            tacticalGrid = state.tacticalGrid,
+            targetForecast = state.targetForecast,
             onMove = { dx, dy -> viewModel.movePlayer(dx, dy) },
             onSelectSkill = { skill -> viewModel.selectSkill(skill) },
             onAttackTarget = { enemy, skill -> viewModel.attackEnemy(enemy, skill) },

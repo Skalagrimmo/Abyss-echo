@@ -74,6 +74,7 @@ data class Player(
     var maxCorruption: Int = 100,
     var currentAp: Int = 3,
     var maxAp: Int = 3,
+    var freeStepsRemaining: Int = 0,
     var fovRadius: Int = 6,
     var torchTurns: Int = 60,
     // Immutable baselines for deterministic stat recalculation on organ upgrades/swaps
